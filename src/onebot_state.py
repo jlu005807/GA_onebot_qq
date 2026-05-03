@@ -4,8 +4,9 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Set
 
-MAX_QUEUE_SIZE = 5
-MAX_MSG_LENGTH = 500
+DEFAULT_MAX_QUEUE_SIZE = 5
+DEFAULT_MAX_MSG_LENGTH = 500
+DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024
 
 
 @dataclass

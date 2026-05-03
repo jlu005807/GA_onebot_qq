@@ -7,6 +7,11 @@ from onebot_paths import setup_sys_path
 GA_ROOT = setup_sys_path()
 
 from llmcore import mykeys
+from onebot_state import (
+    DEFAULT_MAX_FILE_BYTES,
+    DEFAULT_MAX_MSG_LENGTH,
+    DEFAULT_MAX_QUEUE_SIZE,
+)
 
 
 def _read_dotenv(path: str) -> Dict[str, str]:
@@ -50,12 +55,33 @@ def _parse_set(value: str) -> Set[str]:
     return {item.strip() for item in value.split(",") if item.strip()}
 
 
+def _parse_int(value: str, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _resolve_path(path: str) -> str:
+    if not path:
+        return GA_ROOT
+    if os.path.isabs(path):
+        return path
+    return os.path.join(GA_ROOT, path)
+
+
 @dataclass(frozen=True)
 class OneBotConfig:
     ws_url: str
     admin_set: Set[str]
     allowed_users: Set[str]
     access_token: str
+    plain_text_hint: str
+    max_queue_size: int
+    max_msg_length: int
+    data_dir: str
+    max_file_bytes: int
     lock_port: int
     log_file: str
 
@@ -71,6 +97,11 @@ def load_config() -> OneBotConfig:
 
     admin_qq = str(_get_env("ONEBOT_ADMIN_QQ", "")).strip()
     access_token = str(_get_env("ONEBOT_ACCESS_TOKEN", "")).strip()
+    plain_text_hint = str(
+        _get_env("ONEBOT_PLAIN_TEXT_HINT", "请用纯文本回复，不要使用Markdown格式。")
+    ).strip()
+    if plain_text_hint.lower() in {"0", "false", "off", "disable", "disabled"}:
+        plain_text_hint = ""
 
     allowed_raw = str(_get_env("ONEBOT_ALLOWED_USERS", "")).strip()
     if allowed_raw:
@@ -83,12 +114,27 @@ def load_config() -> OneBotConfig:
         }
 
     admin_set = _parse_set(admin_qq) if admin_qq else set()
+    max_queue_size = _parse_int(
+        _get_env("ONEBOT_MAX_QUEUE_SIZE", ""), DEFAULT_MAX_QUEUE_SIZE
+    )
+    max_msg_length = _parse_int(
+        _get_env("ONEBOT_MAX_MSG_LENGTH", ""), DEFAULT_MAX_MSG_LENGTH
+    )
+    data_dir = _resolve_path(_get_env("ONEBOT_DATA_DIR", "data").strip())
+    max_file_bytes = _parse_int(
+        _get_env("ONEBOT_MAX_FILE_BYTES", ""), DEFAULT_MAX_FILE_BYTES
+    )
 
     return OneBotConfig(
         ws_url=ws_url,
         admin_set=admin_set,
         allowed_users=allowed_users,
         access_token=access_token,
+        plain_text_hint=plain_text_hint,
+        max_queue_size=max_queue_size,
+        max_msg_length=max_msg_length,
+        data_dir=data_dir,
+        max_file_bytes=max_file_bytes,
         lock_port=19529,
         log_file="onebot.log",
     )

@@ -20,7 +20,7 @@ pip install websockets
 ```
 
 ## 配置
-在项目根目录创建 .env（已提供示例），配置项优先级:
+在项目根目录创建 .env（可直接复制 .env.example），配置项优先级:
 1) 系统环境变量
 2) .env
 3) mykeys 兜底（仅 ws_url 和 allowed_users）
@@ -31,6 +31,21 @@ ONEBOT_WS_URL=ws://127.0.0.1:8080/onebot/v11/ws
 ONEBOT_ADMIN_QQ=123456789,987654321
 ONEBOT_ALLOWED_USERS=*
 ONEBOT_ACCESS_TOKEN=
+ONEBOT_PLAIN_TEXT_HINT=请用纯文本回复，不要使用Markdown格式。
+ONEBOT_MAX_MSG_LENGTH=500
+ONEBOT_MAX_QUEUE_SIZE=5
+ONEBOT_DATA_DIR=data
+ONEBOT_MAX_FILE_BYTES=10485760
+```
+
+复制示例配置:
+```
+copy .env.example .env
+```
+
+关闭纯文本提示词（可选）:
+```
+ONEBOT_PLAIN_TEXT_HINT=0
 ```
 
 ## 启动
@@ -42,3 +57,7 @@ python src/main.py
 - 群聊必须 @ 机器人才会回复
 - 单条消息长度上限为 500 字
 - 管理员命令仅管理员可用
+- 自动忽略机器人自身消息，文本会移除 CQ 码
+- 消息长度与队列长度可在 .env 中配置
+- 图片/语音/文件会保存到 data/ 下，单文件上限 10MB
+- NapCat 会在消息段提供 url（或 file 为 URL），无 URL 时会跳过并提示

@@ -19,5 +19,8 @@ env/
 # Local settings
 .env
 
+# Local data
+data/
+
 # Editor
 .vscode/

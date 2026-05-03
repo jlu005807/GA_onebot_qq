@@ -1,6 +1,10 @@
 import asyncio
 import json
+import os
 import re
+import urllib.request
+import uuid
+from urllib.parse import urlparse
 
 from onebot_paths import setup_sys_path
 
@@ -8,7 +12,7 @@ setup_sys_path()
 
 from chatapp_common import AgentChatMixin, public_access, split_text
 from onebot_config import OneBotConfig
-from onebot_state import MAX_MSG_LENGTH, MAX_QUEUE_SIZE, OneBotState
+from onebot_state import OneBotState
 
 try:
     import websockets
@@ -27,6 +31,15 @@ class OneBotApp(AgentChatMixin):
         self.config = config
         self.ws = None
         self.bot_qq = ""  # 机器人自身QQ号，连接后获取
+        # 附件落盘目录
+        self.data_dir = self.config.data_dir
+        self._data_dirs = {
+            "image": os.path.join(self.data_dir, "image"),
+            "record": os.path.join(self.data_dir, "record"),
+            "file": os.path.join(self.data_dir, "file"),
+        }
+        for path in self._data_dirs.values():
+            os.makedirs(path, exist_ok=True)
 
     async def send_text(self, chat_id, content, *, msg_id=None, is_group=False, **ctx):
         """发送文本消息到 QQ"""
@@ -64,7 +77,7 @@ class OneBotApp(AgentChatMixin):
             return False
         return False
 
-    async def _process_user_queue(self, user_id, chat_id, is_group, message_id):
+    async def _process_user_queue(self, user_id):
         """从用户队列中逐条处理消息"""
         queue = self.state.user_queues.get(user_id)
         if not queue:
@@ -73,11 +86,12 @@ class OneBotApp(AgentChatMixin):
         self.state.processing_users.add(user_id)
         try:
             while not queue.empty():
-                content = await queue.get()
-                if content.startswith("/"):
+                content, attachments, message_id, chat_id, is_group = await queue.get()
+                if content and content.startswith("/"):
                     await self.handle_command(chat_id, content, msg_id=message_id, is_group=is_group)
                 else:
-                    await self.run_agent(chat_id, content, msg_id=message_id, is_group=is_group)
+                    prompt = self._build_agent_content(content, attachments)
+                    await self.run_agent(chat_id, prompt, msg_id=message_id, is_group=is_group)
                 await asyncio.sleep(1)  # 间隔避免刷屏
         finally:
             self.state.processing_users.discard(user_id)
@@ -88,6 +102,179 @@ class OneBotApp(AgentChatMixin):
         """移除消息中的@标签"""
         content = re.sub(r"\[CQ:at,qq=\d+\]\s*", "", content).strip()
         return content
+
+    def _extract_text(self, raw_msg):
+        """抽取文本并移除 CQ 码"""
+        if isinstance(raw_msg, str):
+            content = raw_msg
+        elif isinstance(raw_msg, list):
+            parts = []
+            for seg in raw_msg:
+                if isinstance(seg, dict) and seg.get("type") == "text":
+                    parts.append(seg.get("data", {}).get("text", ""))
+                elif isinstance(seg, str):
+                    parts.append(seg)
+            content = "".join(parts)
+        else:
+            content = str(raw_msg)
+
+        content = re.sub(r"\[CQ:[^\]]+\]", "", content)
+        return content.strip()
+
+    def _extract_segments(self, raw_msg):
+        if isinstance(raw_msg, list):
+            return [seg for seg in raw_msg if isinstance(seg, dict)]
+        if isinstance(raw_msg, str) and "[CQ:" in raw_msg:
+            return self._parse_cq_segments(raw_msg)
+        return []
+
+    def _parse_cq_segments(self, raw_msg: str):
+        segments = []
+        for code in re.findall(r"\[CQ:[^\]]+\]", raw_msg):
+            seg = self._parse_cq_segment(code)
+            if seg:
+                segments.append(seg)
+        return segments
+
+    def _parse_cq_segment(self, code: str):
+        if not code.startswith("[CQ:") or not code.endswith("]"):
+            return None
+        inner = code[4:-1]
+        if not inner:
+            return None
+        parts = inner.split(",")
+        seg_type = parts[0].strip()
+        data = {}
+        for part in parts[1:]:
+            if "=" in part:
+                key, value = part.split("=", 1)
+                data[key.strip()] = value.strip()
+        return {"type": seg_type, "data": data}
+
+    def _format_attachments(self, attachments):
+        lines = []
+        for idx, item in enumerate(attachments, start=1):
+            size_kb = max(1, item["size"] // 1024)
+            lines.append(
+                f"附件{idx}: type={item['type']} path={item['path']} size={size_kb}KB"
+            )
+        return "\n".join(lines)
+
+    def _build_agent_content(self, content: str, attachments) -> str:
+        """为模型附加纯文本提示词与附件路径"""
+        parts = []
+        if content:
+            parts.append(content)
+        if attachments:
+            parts.append(self._format_attachments(attachments))
+        hint = self.config.plain_text_hint
+        if hint:
+            parts.append(hint)
+        return "\n\n".join(parts)
+
+    def _get_segment_url(self, data: dict) -> str:
+        url = str(data.get("url", "")).strip()
+        if url:
+            return url
+        file_ref = str(data.get("file", "")).strip()
+        if file_ref.startswith("http://") or file_ref.startswith("https://"):
+            return file_ref
+        return ""
+
+    def _build_filename(self, name_hint: str, url: str, default_ext: str) -> str:
+        base = ""
+        ext = ""
+        if name_hint:
+            base, ext = os.path.splitext(os.path.basename(name_hint))
+        if not ext and url:
+            ext = os.path.splitext(urlparse(url).path)[1]
+        if not ext:
+            ext = default_ext
+        if not base:
+            base = "file"
+        base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._")
+        if not base:
+            base = "file"
+        suffix = uuid.uuid4().hex[:8]
+        return f"{base}_{suffix}{ext}"
+
+    def _download_file_sync(self, url: str, dest_path: str, max_bytes: int) -> int:
+        req = urllib.request.Request(url, headers={"User-Agent": "OneBot"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                length = resp.headers.get("Content-Length")
+                if length:
+                    try:
+                        if int(length) > max_bytes:
+                            return 0
+                    except ValueError:
+                        pass
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                total = 0
+                with open(dest_path, "wb") as handle:
+                    while True:
+                        chunk = resp.read(8192)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > max_bytes:
+                            break
+                        handle.write(chunk)
+            if total > max_bytes:
+                try:
+                    os.remove(dest_path)
+                except OSError:
+                    pass
+                return 0
+            return total
+        except Exception as exc:
+            try:
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+            except OSError:
+                pass
+            print(f"[OneBot] download error: {exc}")
+            return 0
+
+    async def _download_to_local(self, url: str, seg_type: str, name_hint: str):
+        save_dir = self._data_dirs.get(seg_type, self.data_dir)
+        default_ext = ".jpg" if seg_type == "image" else ".silk" if seg_type == "record" else ".bin"
+        filename = self._build_filename(name_hint, url, default_ext)
+        dest_path = os.path.join(save_dir, filename)
+        size = await asyncio.to_thread(
+            self._download_file_sync, url, dest_path, self.config.max_file_bytes
+        )
+        if not size:
+            return None
+        return {"type": seg_type, "path": os.path.abspath(dest_path), "size": size}
+
+    async def _download_attachments(self, raw_msg, chat_id, message_id, is_group):
+        attachments = []
+        errors = []
+        for seg in self._extract_segments(raw_msg):
+            seg_type = seg.get("type")
+            if seg_type not in {"image", "record", "file"}:
+                continue
+            data = seg.get("data", {}) if isinstance(seg, dict) else {}
+            url = self._get_segment_url(data)
+            if not url:
+                errors.append(f"{seg_type} 缺少下载地址")
+                continue
+            name_hint = str(data.get("name") or data.get("file") or "").strip()
+            saved = await self._download_to_local(url, seg_type, name_hint)
+            if not saved:
+                errors.append(f"{seg_type} 下载失败或超过大小限制")
+                continue
+            attachments.append(saved)
+
+        if errors:
+            await self.send_text(
+                chat_id,
+                "⚠️ 附件未保存: " + "；".join(errors),
+                msg_id=message_id,
+                is_group=is_group,
+            )
+        return attachments
 
     async def handle_event(self, event: dict):
         """处理来自 OneBot 的事件"""
@@ -104,9 +291,10 @@ class OneBotApp(AgentChatMixin):
 
         # 消息去重，避免重复处理
         message_id = event.get("message_id")
-        if message_id in self.state.processed_ids:
-            return
-        self.state.processed_ids.append(message_id)
+        if message_id is not None:
+            if message_id in self.state.processed_ids:
+                return
+            self.state.processed_ids.append(message_id)
 
         msg_type = event.get("message_type")  # "private" or "group"
         is_group = msg_type == "group"
@@ -116,34 +304,24 @@ class OneBotApp(AgentChatMixin):
         group_id = str(event.get("group_id", "")) if is_group else ""
         chat_id = group_id if is_group else user_id
 
+        # 忽略机器人自身消息，避免回环
+        if self.bot_qq and user_id == self.bot_qq:
+            return
+
         is_admin = user_id in self.config.admin_set
 
         raw_msg = event.get("message", "")
-        if isinstance(raw_msg, str):
-            content = raw_msg.strip()
-        elif isinstance(raw_msg, list):
-            parts = []
-            for seg in raw_msg:
-                if isinstance(seg, dict) and seg.get("type") == "text":
-                    parts.append(seg.get("data", {}).get("text", ""))
-                elif isinstance(seg, str):
-                    parts.append(seg)
-            content = "".join(parts).strip()
-        else:
-            content = str(raw_msg).strip()
-
-        if not content:
-            return
+        content = self._extract_text(raw_msg)
 
         # 权限检查
         if not public_access(self.config.allowed_users) and user_id not in self.config.allowed_users:
             print(f"[OneBot] unauthorized user: {user_id}")
             return
 
-        if len(content) > MAX_MSG_LENGTH:
+        if content and len(content) > self.config.max_msg_length:
             await self.send_text(
                 chat_id,
-                f"⚠️ 消息过长（{len(content)}字，上限{MAX_MSG_LENGTH}字），请精简后重发。",
+                f"⚠️ 消息过长（{len(content)}字，上限{self.config.max_msg_length}字），请精简后重发。",
                 msg_id=message_id,
                 is_group=is_group,
             )
@@ -165,14 +343,8 @@ class OneBotApp(AgentChatMixin):
         if is_group:
             content = self._strip_at(content)
 
-        if not content:
-            return
-
-        tag = f"群{group_id}" if is_group else "私聊"
-        print(f"[OneBot] {tag} 消息 from {user_id} {'[ADMIN]' if is_admin else ''}: {content}")
-
         # 命令优先处理
-        if content.startswith("/"):
+        if content and content.startswith("/"):
             cmd = content.split()[0].lower()
             admin_cmds = ["/stop", "/new", "/restore", "/continue"]
 
@@ -311,24 +483,33 @@ class OneBotApp(AgentChatMixin):
                     is_group=is_group,
                 )
 
+        attachments = await self._download_attachments(raw_msg, chat_id, message_id, is_group)
+
+        if not content and not attachments:
+            return
+
+        tag = f"群{group_id}" if is_group else "私聊"
+        display = content if content else f"[附件{len(attachments)}]"
+        print(f"[OneBot] {tag} 消息 from {user_id} {'[ADMIN]' if is_admin else ''}: {display}")
+
         # 按用户排队限流
         if user_id not in self.state.user_queues:
-            self.state.user_queues[user_id] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+            self.state.user_queues[user_id] = asyncio.Queue(maxsize=self.config.max_queue_size)
 
         queue = self.state.user_queues[user_id]
         if queue.full():
             await self.send_text(
                 chat_id,
-                "⏳ 消息队列已满(5条)，请等待当前回复完成",
+                f"⏳ 消息队列已满({self.config.max_queue_size}条)，请等待当前回复完成",
                 msg_id=message_id,
                 is_group=is_group,
             )
             return
 
-        await queue.put(content)
+        await queue.put((content, attachments, message_id, chat_id, is_group))
 
         if user_id not in self.state.processing_users:
-            asyncio.create_task(self._process_user_queue(user_id, chat_id, is_group, message_id))
+            asyncio.create_task(self._process_user_queue(user_id))
 
     async def connect_and_run(self):
         """连接到 OneBot 的反向 WebSocket 并处理消息"""
