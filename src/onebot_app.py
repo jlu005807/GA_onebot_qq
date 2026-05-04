@@ -136,6 +136,9 @@ DANGER_KEYWORDS = [
     "Firefox",
 ]
 
+# Keep the keyword list for historical reference, but disable hard keyword
+# interception in OneBot layer; admin distinction is passed to GA context.
+DANGER_KEYWORDS = []
 QUEUE_IDLE_SECONDS = 5
 
 
@@ -169,20 +172,57 @@ class OneBotApp(AgentChatMixin):
             return True
         return user_id in self.config.allowed_users
 
+    def _parse_send_content(self, text: str):
+        """解析发送内容中的 [CQ:at,qq=xxx] 语法，转为消息段列表"""
+        segments = []
+        last_end = 0
+        for m in re.finditer(r"\[CQ:at,qq=(\d+)\]", text):
+            # 前面的纯文本
+            if m.start() > last_end:
+                pre_text = text[last_end:m.start()]
+                if pre_text:
+                    segments.append({"type": "text", "data": {"text": pre_text}})
+            # at 段
+            qq = m.group(1)
+            segments.append({"type": "at", "data": {"qq": qq}})
+            last_end = m.end()
+        # 剩余文本
+        if last_end < len(text):
+            remaining = text[last_end:]
+            if remaining:
+                segments.append({"type": "text", "data": {"text": remaining}})
+        return segments
+
     async def send_text(self, chat_id, content, *, msg_id=None, is_group=False, **ctx):
         """发送文本消息到 QQ"""
         if not self.ws:
             print("[OneBot] ws not connected, cannot send")
             return
+        
+        # 过滤掉开头的 "LLM Running (Turn x) ..." 状态行
+        if content:
+            lines = content.split("\n")
+            if lines and re.match(r'^LLM Running \(Turn \d+\) \.\.\.', lines[0]):
+                content = "\n".join(lines[1:]).lstrip()
+        
+        # 解析 [CQ:at,qq=xxx] 语法
+        content_segments = self._parse_send_content(content or "")
+        
         action = "send_group_msg" if is_group else "send_private_msg"
         for part in split_text(content, self.split_limit):
             params = {"group_id": int(chat_id)} if is_group else {"user_id": int(chat_id)}
-            params["message"] = {"type": "text", "data": {"text": part}}
+            # 构建消息段
+            msg_segments = []
             if msg_id:
-                params["message"] = [
-                    {"type": "reply", "data": {"id": str(msg_id)}},
-                    {"type": "text", "data": {"text": part}},
-                ]
+                msg_segments.append({"type": "reply", "data": {"id": str(msg_id)}})
+            # 对当前分片也做 at 解析
+            part_segments = self._parse_send_content(part)
+            if part_segments:
+                msg_segments.extend(part_segments)
+            else:
+                msg_segments.append({"type": "text", "data": {"text": part}})
+            
+            params["message"] = msg_segments if len(msg_segments) > 1 else msg_segments[0]
             payload = {
                 "action": action,
                 "params": params,
@@ -230,7 +270,8 @@ class OneBotApp(AgentChatMixin):
                     break
 
                 try:
-                    content, attachments, message_id, chat_id, is_group, is_admin = item
+                    content, attachments, message_id, chat_id, is_group, is_admin, \
+                        sender_qq, sender_nickname, at_mentions = item
                     if content and content.startswith("/"):
                         await self.handle_command(
                             chat_id, content, msg_id=message_id, is_group=is_group
@@ -241,6 +282,9 @@ class OneBotApp(AgentChatMixin):
                             attachments,
                             is_group=is_group,
                             is_admin=is_admin,
+                            sender_nickname=sender_nickname,
+                            sender_qq=sender_qq,
+                            at_mentions=at_mentions,
                         )
                         await self.run_agent(chat_id, prompt, msg_id=message_id, is_group=is_group)
                     await asyncio.sleep(1)  # 间隔避免刷屏
@@ -271,6 +315,24 @@ class OneBotApp(AgentChatMixin):
         if "[CQ:" in content:
             content = re.sub(r"\[CQ:[^\]]+\]", "", content)
         return content.strip()
+
+    def _extract_at_mentions(self, raw_msg, bot_qq: str):
+        """提取消息中@的用户QQ号列表（排除机器人自身）"""
+        mentions = []
+        # 处理数组格式消息
+        if isinstance(raw_msg, list):
+            for seg in raw_msg:
+                if isinstance(seg, dict) and seg.get("type") == "at":
+                    qq = str(seg.get("data", {}).get("qq", ""))
+                    if qq and qq != bot_qq and qq != "all":
+                        mentions.append(qq)
+        # 处理字符串格式消息
+        elif isinstance(raw_msg, str):
+            for m in re.finditer(r"\[CQ:at,qq=(\d+)\]", raw_msg):
+                qq = m.group(1)
+                if qq != bot_qq:
+                    mentions.append(qq)
+        return list(dict.fromkeys(mentions))  # 去重保序
 
     def _extract_segments(self, raw_msg):
         if isinstance(raw_msg, list):
@@ -311,10 +373,18 @@ class OneBotApp(AgentChatMixin):
             )
         return "\n".join(lines)
 
-    def _build_agent_content(self, content: str, attachments, *, is_group: bool, is_admin: bool) -> str:
+    def _build_agent_content(self, content: str, attachments, *, is_group: bool, is_admin: bool,
+                             sender_nickname: str = "", sender_qq: str = "", at_mentions: list = None) -> str:
         """为模型附加上下文信息、纯文本提示词与附件路径"""
         parts = []
         parts.append(f"上下文: 群聊={1 if is_group else 0} 管理员={1 if is_admin else 0}")
+        # 发送人信息
+        if sender_qq:
+            parts.append(f"发送人QQ: {sender_qq}" + (f" 昵称: {sender_nickname}" if sender_nickname else ""))
+        # 被@的用户列表（排除机器人自身）
+        if at_mentions:
+            parts.append(f"消息中@的用户QQ: {', '.join(at_mentions)}")
+            parts.append("提示: 如需@某人回复，请在回复中使用 [CQ:at,qq=QQ号] 格式，例如 [CQ:at,qq=123456] 你好")
         if content:
             parts.append(content)
         if attachments:
@@ -322,6 +392,54 @@ class OneBotApp(AgentChatMixin):
         hint = self.config.plain_text_hint
         if hint:
             parts.append(hint)
+        
+        # 普通用户权限限制提示
+        if not is_admin:
+            parts.append("注意: 当前用户是普通用户，无法进行文件级、进程级、硬件级的操作，只可以聊天和查询网页资料。请勿执行危险操作。")
+        
+        return "\n\n".join(parts)
+
+    def _build_agent_content(
+        self,
+        content: str,
+        attachments,
+        *,
+        is_group: bool,
+        is_admin: bool,
+        sender_nickname: str = "",
+        sender_qq: str = "",
+        at_mentions: list = None,
+    ) -> str:
+        """Build GA prompt content with context only, no role-based interception."""
+        parts = []
+        parts.append(f"上下文: 群聊={1 if is_group else 0} 管理员={1 if is_admin else 0}")
+        if sender_qq:
+            sender_line = f"发送人QQ: {sender_qq}"
+            if sender_nickname:
+                sender_line += f" 昵称: {sender_nickname}"
+            parts.append(sender_line)
+        if at_mentions:
+            parts.append(f"消息中@的用户QQ: {', '.join(at_mentions)}")
+            parts.append(
+                "提示: 如需@某人回复，请在回复中使用 [CQ:at,qq=QQ号] 格式，例如 [CQ:at,qq=123456] 你好"
+            )
+        if content:
+            parts.append(content)
+        if attachments:
+            parts.append(self._format_attachments(attachments))
+        hint = self.config.plain_text_hint
+        if hint:
+            parts.append(hint)
+        if is_admin:
+            parts.append(
+                "权限策略: 当前用户是管理员。涉及文件级、进程级、硬件级的调整可按需执行，但仍需先说明风险并谨慎操作。"
+            )
+        else:
+            parts.append(
+                "权限策略: 当前用户不是管理员。禁止执行文件级、进程级、硬件级操作。"
+                "例如: 查询/修改文件目录、创建/删除/管理进程、调节屏幕和CPU等硬件设置。"
+                "如用户提出此类请求，请明确拒绝并提示联系管理员。"
+            )
         return "\n\n".join(parts)
 
     def _get_or_create_queue(self, user_id: str) -> asyncio.Queue:
@@ -446,11 +564,13 @@ class OneBotApp(AgentChatMixin):
     async def handle_event(self, event: dict):
         """处理来自 OneBot 的事件"""
         post_type = event.get("post_type", "")
+        print(f"[DEBUG] handle_event called, post_type={post_type}")
 
         if post_type != "message":
             return
 
         raw_msg = event.get("message", "")
+        print(f"[DEBUG] raw_msg={raw_msg}")
 
         # 消息去重，避免重复处理
         message_id = event.get("message_id")
@@ -555,8 +675,13 @@ class OneBotApp(AgentChatMixin):
         display = content if content else f"[附件{len(attachments)}]"
         print(f"[OneBot] {tag} 消息 from {user_id} {'[ADMIN]' if is_admin else ''}: {display}")
 
+        # 提取发送人昵称和@提及列表
+        sender_nickname = sender.get("nickname", "") or sender.get("card", "") or ""
+        at_mentions = self._extract_at_mentions(raw_msg, self.bot_qq)
+
         try:
-            queue.put_nowait((content, attachments, message_id, chat_id, is_group, is_admin))
+            queue.put_nowait((content, attachments, message_id, chat_id, is_group, is_admin,
+                              user_id, sender_nickname, at_mentions))
         except asyncio.QueueFull:
             self._cleanup_attachments(attachments)
             await self.send_text(
@@ -566,9 +691,6 @@ class OneBotApp(AgentChatMixin):
                 is_group=is_group,
             )
             return
-
-        self._log_message(user_id, group_id, is_group, is_admin, content or "")
-        self._log_attachments(user_id, group_id, is_group, attachments)
 
         if user_id not in self.state.processing_users:
             asyncio.create_task(self._process_user_queue(user_id))
@@ -598,8 +720,11 @@ class OneBotApp(AgentChatMixin):
                     try:
                         async for raw_msg in ws:
                             try:
+                                print(f"[DEBUG] raw websocket msg: {raw_msg[:500]}")
                                 event = json.loads(raw_msg)
-                                if event.get("post_type") == "meta_event":
+                                post_type = event.get("post_type")
+                                print(f"[DEBUG] parsed post_type={post_type}")
+                                if post_type == "meta_event":
                                     continue
                                 asyncio.create_task(self.handle_event(event))
                             except json.JSONDecodeError:

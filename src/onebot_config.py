@@ -39,7 +39,7 @@ def _read_dotenv(path: str) -> Dict[str, str]:
     return data
 
 
-_DOTENV = _read_dotenv(os.path.join(GA_ROOT, ".env"))
+_DOTENV = _read_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
 
 def _get_env(key: str, default: str = "") -> str:
@@ -106,7 +106,7 @@ def load_config() -> OneBotConfig:
     ws_url = str(
         _get_env(
             "ONEBOT_WS_URL",
-            mykeys.get("onebot_ws_url", "") or "ws://127.0.0.1:8080/onebot/v11/ws",
+            mykeys.get("onebot_ws_url", "") or "ws://127.0.0.1:8080",
         )
     ).strip()
 
