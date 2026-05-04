@@ -73,6 +73,38 @@ python src/main.py
 - 图片/语音/文件会保存到 data/ 下，单文件上限 10MB
 - NapCat 会在消息段提供 url（或 file 为 URL），无 URL 时会跳过并提示
 
+## 消息流程
+- 接收事件并去重（message_id）
+- 群聊检查：开关、白名单、必须 @ 机器人
+- 权限检查：管理员自动放行，普通用户需在允许列表
+- 命令优先处理；普通消息进行敏感关键词拦截
+- 下载附件并入队，队列 worker 串行处理
+
+## 发送给 GA 的内容格式
+顺序固定为：上下文行 → 文本 → 附件路径列表 → 纯文本提示词。
+
+示例：
+```
+上下文: 群聊=1 管理员=0
+
+请帮我看看这张图
+
+附件1: type=image path=D:\\...\\data\\image\\pic_ab12cd.jpg size=512KB
+
+请用纯文本回复，不要使用Markdown格式。
+```
+
+## 权限与群聊策略
+- 管理员集合由 `ONEBOT_ADMIN_QQ` 配置
+- 用户允许列表由 `ONEBOT_ALLOWED_USERS` 配置（`*` 表示全部）
+- 群聊开关：`ONEBOT_ALLOW_GROUP`，群白名单：`ONEBOT_ALLOWED_GROUPS`
+- 群聊消息必须 @ 机器人
+
+## 附件与存储
+- 目录：`data/image`、`data/record`、`data/file`
+- 默认单文件 10MB（`ONEBOT_MAX_FILE_BYTES` 可调）
+- 仅当消息段包含可访问 `url` 时才下载
+
 ## 日志
 - 每次启动会清空并重新记录
 - data/message.log: 记录消息（时间、用户、群号、管理员、文本）

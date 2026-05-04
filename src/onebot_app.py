@@ -205,6 +205,16 @@ class OneBotApp(AgentChatMixin):
             return False
         return False
 
+    def _ensure_bot_qq(self, event: dict) -> bool:
+        if self.bot_qq:
+            return True
+        self_id = event.get("self_id")
+        if not self_id:
+            return False
+        self.bot_qq = str(self_id)
+        print(f"[OneBot] Bot QQ: {self.bot_qq}")
+        return True
+
     async def _process_user_queue(self, user_id):
         """从用户队列中逐条处理消息"""
         queue = self.state.user_queues.get(user_id)
@@ -437,14 +447,10 @@ class OneBotApp(AgentChatMixin):
         """处理来自 OneBot 的事件"""
         post_type = event.get("post_type", "")
 
-        if not self.bot_qq:
-            self_id = event.get("self_id")
-            if self_id:
-                self.bot_qq = str(self_id)
-                print(f"[OneBot] Bot QQ: {self.bot_qq}")
-
         if post_type != "message":
             return
+
+        raw_msg = event.get("message", "")
 
         # 消息去重，避免重复处理
         message_id = event.get("message_id")
@@ -467,7 +473,7 @@ class OneBotApp(AgentChatMixin):
             return
 
         # 忽略机器人自身消息，避免回环
-        if self.bot_qq and user_id == self.bot_qq:
+        if self._ensure_bot_qq(event) and user_id == self.bot_qq:
             return
 
         # 群聊仅在@机器人时响应
@@ -479,20 +485,14 @@ class OneBotApp(AgentChatMixin):
                 return
             if not public_access(self.config.allowed_groups) and group_id not in self.config.allowed_groups:
                 return
-            if not self.bot_qq:
-                self_id = event.get("self_id")
-                if self_id:
-                    self.bot_qq = str(self_id)
-                    print(f"[OneBot] Bot QQ initialized late: {self.bot_qq}")
-                else:
-                    print("[OneBot] WARNING: cannot get bot_qq, ignoring group msg")
-                    return
+            if not self._ensure_bot_qq(event):
+                print("[OneBot] WARNING: cannot get bot_qq, ignoring group msg")
+                return
             if not self._is_at_bot(raw_msg):
                 return
 
         is_admin = self._is_admin_user(user_id)
 
-        raw_msg = event.get("message", "")
         content = self._extract_text(raw_msg)
 
         # 权限检查（管理员自动放行）
