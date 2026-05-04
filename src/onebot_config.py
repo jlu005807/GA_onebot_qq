@@ -63,6 +63,19 @@ def _parse_int(value: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _parse_bool(value: str, default: bool) -> bool:
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _resolve_path(path: str) -> str:
     if not path:
         return GA_ROOT
@@ -76,6 +89,8 @@ class OneBotConfig:
     ws_url: str
     admin_set: Set[str]
     allowed_users: Set[str]
+    allow_group: bool
+    allowed_groups: Set[str]
     access_token: str
     plain_text_hint: str
     max_queue_size: int
@@ -114,6 +129,9 @@ def load_config() -> OneBotConfig:
         }
 
     admin_set = _parse_set(admin_qq) if admin_qq else set()
+    allow_group = _parse_bool(_get_env("ONEBOT_ALLOW_GROUP", ""), True)
+    allowed_groups_raw = str(_get_env("ONEBOT_ALLOWED_GROUPS", "*")).strip()
+    allowed_groups = _parse_set(allowed_groups_raw) if allowed_groups_raw else {"*"}
     max_queue_size = _parse_int(
         _get_env("ONEBOT_MAX_QUEUE_SIZE", ""), DEFAULT_MAX_QUEUE_SIZE
     )
@@ -129,6 +147,8 @@ def load_config() -> OneBotConfig:
         ws_url=ws_url,
         admin_set=admin_set,
         allowed_users=allowed_users,
+        allow_group=allow_group,
+        allowed_groups=allowed_groups,
         access_token=access_token,
         plain_text_hint=plain_text_hint,
         max_queue_size=max_queue_size,

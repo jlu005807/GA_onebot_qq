@@ -21,6 +21,124 @@ except ImportError:
     raise SystemExit(1)
 
 
+DANGER_KEYWORDS = [
+    "创建文件",
+    "写入",
+    "删除",
+    "修改文件",
+    "编辑文件",
+    "file_write",
+    "file_patch",
+    "file_read",
+    "移动文件",
+    "重命名",
+    "复制文件",
+    "压缩",
+    "解压",
+    "查看目录",
+    "列出文件",
+    "目录列表",
+    "ls ",
+    "dir ",
+    "tree",
+    "目录结构",
+    "文件夹",
+    "浏览目录",
+    "查目录",
+    "看看目录",
+    "folder",
+    "explorer",
+    "find ",
+    "find.exe",
+    "查看文件",
+    "列出目录",
+    "show dir",
+    "list files",
+    "关机",
+    "重启",
+    "shutdown",
+    "restart",
+    "注销",
+    "logoff",
+    "进程",
+    "杀进程",
+    "taskkill",
+    "kill",
+    "结束进程",
+    "启动服务",
+    "停止服务",
+    "小程序",
+    "线程",
+    "运行的程序",
+    "任务管理器",
+    "tasklist",
+    "wmic",
+    "ps ",
+    "top",
+    "pkill",
+    "进程管理",
+    "服务管理",
+    "服务列表",
+    "正在运行",
+    "后台程序",
+    "关闭屏幕",
+    "屏幕",
+    "显示器",
+    "休眠",
+    "睡眠",
+    "待机",
+    "唤醒",
+    "硬件",
+    "电源管理",
+    "powercfg",
+    "关屏",
+    "bat",
+    ".cmd",
+    "批处理",
+    "脚本文件",
+    "网络配置",
+    "端口",
+    "防火墙",
+    "iptables",
+    "netstat",
+    "ping",
+    "curl",
+    "wget",
+    "环境变量",
+    "密码",
+    "密钥",
+    "token",
+    "secret",
+    "配置文件",
+    ".env",
+    "执行脚本",
+    "运行命令",
+    "cmd",
+    "powershell",
+    "bash",
+    "code_run",
+    "系统信息",
+    "内存",
+    "CPU",
+    "磁盘",
+    "sysinfo",
+    "systeminfo",
+    "浏览器",
+    "打开网页",
+    "打开链接",
+    "网页截图",
+    "web_scan",
+    "web_execute",
+    "selenium",
+    "浏览器操作",
+    "网页操作",
+    "Chrome",
+    "Firefox",
+]
+
+QUEUE_IDLE_SECONDS = 5
+
+
 # OneBot 事件处理与消息转发
 class OneBotApp(AgentChatMixin):
     label, source, split_limit = "OneBot", "onebot", 1500
@@ -40,6 +158,16 @@ class OneBotApp(AgentChatMixin):
         }
         for path in self._data_dirs.values():
             os.makedirs(path, exist_ok=True)
+
+    def _is_admin_user(self, user_id: str) -> bool:
+        return user_id in self.config.admin_set
+
+    def _is_allowed_user(self, user_id: str, is_admin: bool) -> bool:
+        if is_admin:
+            return True
+        if public_access(self.config.allowed_users):
+            return True
+        return user_id in self.config.allowed_users
 
     async def send_text(self, chat_id, content, *, msg_id=None, is_group=False, **ctx):
         """发送文本消息到 QQ"""
@@ -85,23 +213,35 @@ class OneBotApp(AgentChatMixin):
 
         self.state.processing_users.add(user_id)
         try:
-            while not queue.empty():
-                content, attachments, message_id, chat_id, is_group = await queue.get()
-                if content and content.startswith("/"):
-                    await self.handle_command(chat_id, content, msg_id=message_id, is_group=is_group)
-                else:
-                    prompt = self._build_agent_content(content, attachments)
-                    await self.run_agent(chat_id, prompt, msg_id=message_id, is_group=is_group)
-                await asyncio.sleep(1)  # 间隔避免刷屏
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=QUEUE_IDLE_SECONDS)
+                except asyncio.TimeoutError:
+                    break
+
+                try:
+                    content, attachments, message_id, chat_id, is_group, is_admin = item
+                    if content and content.startswith("/"):
+                        await self.handle_command(
+                            chat_id, content, msg_id=message_id, is_group=is_group
+                        )
+                    else:
+                        prompt = self._build_agent_content(
+                            content,
+                            attachments,
+                            is_group=is_group,
+                            is_admin=is_admin,
+                        )
+                        await self.run_agent(chat_id, prompt, msg_id=message_id, is_group=is_group)
+                    await asyncio.sleep(1)  # 间隔避免刷屏
+                except Exception as exc:
+                    print(f"[OneBot] queue item error: {exc}")
+                finally:
+                    queue.task_done()
         finally:
             self.state.processing_users.discard(user_id)
             if user_id in self.state.user_queues and self.state.user_queues[user_id].empty():
                 del self.state.user_queues[user_id]
-
-    def _strip_at(self, content):
-        """移除消息中的@标签"""
-        content = re.sub(r"\[CQ:at,qq=\d+\]\s*", "", content).strip()
-        return content
 
     def _extract_text(self, raw_msg):
         """抽取文本并移除 CQ 码"""
@@ -118,7 +258,8 @@ class OneBotApp(AgentChatMixin):
         else:
             content = str(raw_msg)
 
-        content = re.sub(r"\[CQ:[^\]]+\]", "", content)
+        if "[CQ:" in content:
+            content = re.sub(r"\[CQ:[^\]]+\]", "", content)
         return content.strip()
 
     def _extract_segments(self, raw_msg):
@@ -160,9 +301,10 @@ class OneBotApp(AgentChatMixin):
             )
         return "\n".join(lines)
 
-    def _build_agent_content(self, content: str, attachments) -> str:
-        """为模型附加纯文本提示词与附件路径"""
+    def _build_agent_content(self, content: str, attachments, *, is_group: bool, is_admin: bool) -> str:
+        """为模型附加上下文信息、纯文本提示词与附件路径"""
         parts = []
+        parts.append(f"上下文: 群聊={1 if is_group else 0} 管理员={1 if is_admin else 0}")
         if content:
             parts.append(content)
         if attachments:
@@ -171,6 +313,21 @@ class OneBotApp(AgentChatMixin):
         if hint:
             parts.append(hint)
         return "\n\n".join(parts)
+
+    def _get_or_create_queue(self, user_id: str) -> asyncio.Queue:
+        if user_id not in self.state.user_queues:
+            self.state.user_queues[user_id] = asyncio.Queue(maxsize=self.config.max_queue_size)
+        return self.state.user_queues[user_id]
+
+    def _cleanup_attachments(self, attachments) -> None:
+        for item in attachments:
+            path = item.get("path") if isinstance(item, dict) else None
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def _get_segment_url(self, data: dict) -> str:
         url = str(data.get("url", "")).strip()
@@ -300,35 +457,28 @@ class OneBotApp(AgentChatMixin):
         is_group = msg_type == "group"
 
         sender = event.get("sender", {})
-        user_id = str(sender.get("user_id", "unknown"))
+        raw_user_id = sender.get("user_id") or event.get("user_id")
+        user_id = str(raw_user_id).strip() if raw_user_id is not None else ""
         group_id = str(event.get("group_id", "")) if is_group else ""
         chat_id = group_id if is_group else user_id
+
+        if not user_id:
+            print("[OneBot] missing user_id, ignore message")
+            return
 
         # 忽略机器人自身消息，避免回环
         if self.bot_qq and user_id == self.bot_qq:
             return
 
-        is_admin = user_id in self.config.admin_set
-
-        raw_msg = event.get("message", "")
-        content = self._extract_text(raw_msg)
-
-        # 权限检查
-        if not public_access(self.config.allowed_users) and user_id not in self.config.allowed_users:
-            print(f"[OneBot] unauthorized user: {user_id}")
-            return
-
-        if content and len(content) > self.config.max_msg_length:
-            await self.send_text(
-                chat_id,
-                f"⚠️ 消息过长（{len(content)}字，上限{self.config.max_msg_length}字），请精简后重发。",
-                msg_id=message_id,
-                is_group=is_group,
-            )
-            return
-
         # 群聊仅在@机器人时响应
         if is_group:
+            if not self.config.allow_group:
+                return
+            if not group_id:
+                print("[OneBot] missing group_id, ignore group message")
+                return
+            if not public_access(self.config.allowed_groups) and group_id not in self.config.allowed_groups:
+                return
             if not self.bot_qq:
                 self_id = event.get("self_id")
                 if self_id:
@@ -340,8 +490,24 @@ class OneBotApp(AgentChatMixin):
             if not self._is_at_bot(raw_msg):
                 return
 
-        if is_group:
-            content = self._strip_at(content)
+        is_admin = self._is_admin_user(user_id)
+
+        raw_msg = event.get("message", "")
+        content = self._extract_text(raw_msg)
+
+        # 权限检查（管理员自动放行）
+        if not self._is_allowed_user(user_id, is_admin):
+            print(f"[OneBot] unauthorized user: {user_id}")
+            return
+
+        if content and len(content) > self.config.max_msg_length:
+            await self.send_text(
+                chat_id,
+                f"⚠️ 消息过长（{len(content)}字，上限{self.config.max_msg_length}字），请精简后重发。",
+                msg_id=message_id,
+                is_group=is_group,
+            )
+            return
 
         # 命令优先处理
         if content and content.startswith("/"):
@@ -360,121 +526,7 @@ class OneBotApp(AgentChatMixin):
 
         # 非管理员：敏感操作拦截
         if not is_admin:
-            danger_keywords = [
-                "创建文件",
-                "写入",
-                "删除",
-                "修改文件",
-                "编辑文件",
-                "file_write",
-                "file_patch",
-                "file_read",
-                "移动文件",
-                "重命名",
-                "复制文件",
-                "压缩",
-                "解压",
-                "查看目录",
-                "列出文件",
-                "目录列表",
-                "ls ",
-                "dir ",
-                "tree",
-                "目录结构",
-                "文件夹",
-                "浏览目录",
-                "查目录",
-                "看看目录",
-                "folder",
-                "explorer",
-                "find ",
-                "find.exe",
-                "查看文件",
-                "列出目录",
-                "show dir",
-                "list files",
-                "关机",
-                "重启",
-                "shutdown",
-                "restart",
-                "注销",
-                "logoff",
-                "进程",
-                "杀进程",
-                "taskkill",
-                "kill",
-                "结束进程",
-                "启动服务",
-                "停止服务",
-                "小程序",
-                "线程",
-                "运行的程序",
-                "任务管理器",
-                "tasklist",
-                "wmic",
-                "ps ",
-                "top",
-                "pkill",
-                "进程管理",
-                "服务管理",
-                "服务列表",
-                "正在运行",
-                "后台程序",
-                "关闭屏幕",
-                "屏幕",
-                "显示器",
-                "休眠",
-                "睡眠",
-                "待机",
-                "唤醒",
-                "硬件",
-                "电源管理",
-                "powercfg",
-                "关屏",
-                "bat",
-                ".cmd",
-                "批处理",
-                "脚本文件",
-                "网络配置",
-                "端口",
-                "防火墙",
-                "iptables",
-                "netstat",
-                "ping",
-                "curl",
-                "wget",
-                "环境变量",
-                "密码",
-                "密钥",
-                "token",
-                "secret",
-                "配置文件",
-                ".env",
-                "执行脚本",
-                "运行命令",
-                "cmd",
-                "powershell",
-                "bash",
-                "code_run",
-                "系统信息",
-                "内存",
-                "CPU",
-                "磁盘",
-                "sysinfo",
-                "systeminfo",
-                "浏览器",
-                "打开网页",
-                "打开链接",
-                "网页截图",
-                "web_scan",
-                "web_execute",
-                "selenium",
-                "浏览器操作",
-                "网页操作",
-                "Chrome",
-                "Firefox",
-            ]
-            has_danger = any(kw in content for kw in danger_keywords)
+            has_danger = any(kw in content for kw in DANGER_KEYWORDS)
             if has_danger:
                 return await self.send_text(
                     chat_id,
@@ -482,6 +534,17 @@ class OneBotApp(AgentChatMixin):
                     msg_id=message_id,
                     is_group=is_group,
                 )
+
+        # 按用户排队限流
+        queue = self._get_or_create_queue(user_id)
+        if queue.full():
+            await self.send_text(
+                chat_id,
+                f"⏳ 消息队列已满({self.config.max_queue_size}条)，请等待当前回复完成",
+                msg_id=message_id,
+                is_group=is_group,
+            )
+            return
 
         attachments = await self._download_attachments(raw_msg, chat_id, message_id, is_group)
 
@@ -492,12 +555,10 @@ class OneBotApp(AgentChatMixin):
         display = content if content else f"[附件{len(attachments)}]"
         print(f"[OneBot] {tag} 消息 from {user_id} {'[ADMIN]' if is_admin else ''}: {display}")
 
-        # 按用户排队限流
-        if user_id not in self.state.user_queues:
-            self.state.user_queues[user_id] = asyncio.Queue(maxsize=self.config.max_queue_size)
-
-        queue = self.state.user_queues[user_id]
-        if queue.full():
+        try:
+            queue.put_nowait((content, attachments, message_id, chat_id, is_group, is_admin))
+        except asyncio.QueueFull:
+            self._cleanup_attachments(attachments)
             await self.send_text(
                 chat_id,
                 f"⏳ 消息队列已满({self.config.max_queue_size}条)，请等待当前回复完成",
@@ -506,7 +567,8 @@ class OneBotApp(AgentChatMixin):
             )
             return
 
-        await queue.put((content, attachments, message_id, chat_id, is_group))
+        self._log_message(user_id, group_id, is_group, is_admin, content or "")
+        self._log_attachments(user_id, group_id, is_group, attachments)
 
         if user_id not in self.state.processing_users:
             asyncio.create_task(self._process_user_queue(user_id))
