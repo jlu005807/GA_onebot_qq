@@ -1,0 +1,157 @@
+import re
+from typing import Any, Dict, List, Sequence
+
+
+def normalize_outgoing_content(content: str) -> str:
+    if not content:
+        return ""
+    lines = content.split("\n")
+    if lines and re.match(r"^LLM Running \(Turn \d+\) \.\.\.", lines[0]):
+        return "\n".join(lines[1:]).lstrip()
+    return content
+
+
+def parse_send_content(text: str) -> List[Dict[str, Any]]:
+    segments: List[Dict[str, Any]] = []
+    last_end = 0
+    for match in re.finditer(r"\[CQ:at,qq=(\d+)\]", text or ""):
+        if match.start() > last_end:
+            pre_text = text[last_end : match.start()]
+            if pre_text:
+                segments.append({"type": "text", "data": {"text": pre_text}})
+        segments.append({"type": "at", "data": {"qq": match.group(1)}})
+        last_end = match.end()
+    if last_end < len(text or ""):
+        remaining = text[last_end:]
+        if remaining:
+            segments.append({"type": "text", "data": {"text": remaining}})
+    return segments
+
+
+def is_at_bot(raw_msg: Any, bot_qq: str) -> bool:
+    if isinstance(raw_msg, str):
+        return f"[CQ:at,qq={bot_qq}]" in raw_msg
+    if isinstance(raw_msg, list):
+        for seg in raw_msg:
+            if isinstance(seg, dict) and seg.get("type") == "at":
+                if str(seg.get("data", {}).get("qq", "")) == bot_qq:
+                    return True
+    return False
+
+
+def extract_text(raw_msg: Any) -> str:
+    if isinstance(raw_msg, str):
+        content = raw_msg
+    elif isinstance(raw_msg, list):
+        parts: List[str] = []
+        for seg in raw_msg:
+            if isinstance(seg, dict) and seg.get("type") == "text":
+                parts.append(str(seg.get("data", {}).get("text", "")))
+            elif isinstance(seg, str):
+                parts.append(seg)
+        content = "".join(parts)
+    else:
+        content = str(raw_msg)
+
+    if "[CQ:" in content:
+        content = re.sub(r"\[CQ:[^\]]+\]", "", content)
+    return content.strip()
+
+
+def extract_at_mentions(raw_msg: Any, bot_qq: str) -> List[str]:
+    mentions: List[str] = []
+    if isinstance(raw_msg, list):
+        for seg in raw_msg:
+            if isinstance(seg, dict) and seg.get("type") == "at":
+                qq = str(seg.get("data", {}).get("qq", ""))
+                if qq and qq != bot_qq and qq != "all":
+                    mentions.append(qq)
+    elif isinstance(raw_msg, str):
+        for match in re.finditer(r"\[CQ:at,qq=(\d+)\]", raw_msg):
+            qq = match.group(1)
+            if qq != bot_qq:
+                mentions.append(qq)
+    # de-dup while keeping order
+    return list(dict.fromkeys(mentions))
+
+
+def extract_segments(raw_msg: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw_msg, list):
+        return [seg for seg in raw_msg if isinstance(seg, dict)]
+    if isinstance(raw_msg, str) and "[CQ:" in raw_msg:
+        return _parse_cq_segments(raw_msg)
+    return []
+
+
+def _parse_cq_segments(raw_msg: str) -> List[Dict[str, Any]]:
+    segments: List[Dict[str, Any]] = []
+    for code in re.findall(r"\[CQ:[^\]]+\]", raw_msg):
+        seg = _parse_cq_segment(code)
+        if seg:
+            segments.append(seg)
+    return segments
+
+
+def _parse_cq_segment(code: str) -> Dict[str, Any]:
+    if not code.startswith("[CQ:") or not code.endswith("]"):
+        return {}
+    inner = code[4:-1]
+    if not inner:
+        return {}
+    parts = inner.split(",")
+    seg_type = parts[0].strip()
+    data: Dict[str, str] = {}
+    for part in parts[1:]:
+        if "=" in part:
+            key, value = part.split("=", 1)
+            data[key.strip()] = value.strip()
+    return {"type": seg_type, "data": data}
+
+
+def format_attachments(attachments: Sequence[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for idx, item in enumerate(attachments, start=1):
+        size_kb = max(1, int(item.get("size", 0)) // 1024)
+        lines.append(
+            f"attachment{idx}: type={item.get('type')} path={item.get('path')} size={size_kb}KB"
+        )
+    return "\n".join(lines)
+
+
+def build_agent_prompt(
+    content: str,
+    attachments: Sequence[Dict[str, Any]],
+    *,
+    is_group: bool,
+    is_admin: bool,
+    sender_nickname: str = "",
+    sender_qq: str = "",
+    at_mentions: Sequence[str] = (),
+    plain_text_hint: str = "",
+) -> str:
+    parts: List[str] = [f"context: group={1 if is_group else 0} admin={1 if is_admin else 0}"]
+    if sender_qq:
+        sender_line = f"sender_qq: {sender_qq}"
+        if sender_nickname:
+            sender_line += f" nickname: {sender_nickname}"
+        parts.append(sender_line)
+    if at_mentions:
+        parts.append(f"mentioned_qq: {', '.join(at_mentions)}")
+        parts.append("tip: if you need to @ someone, use [CQ:at,qq=<qq>].")
+    if content:
+        parts.append(content)
+    if attachments:
+        parts.append("attachments:\n" + format_attachments(attachments))
+    if plain_text_hint:
+        parts.append(plain_text_hint)
+
+    if is_admin:
+        parts.append(
+            "policy: user is admin. File/process/hardware operations are allowed with risk notice."
+        )
+    else:
+        parts.append(
+            "policy: user is NOT admin. File/process/hardware operations are forbidden. "
+            "Reject requests like directory operations, process control, and screen/CPU changes."
+        )
+    return "\n\n".join(parts)

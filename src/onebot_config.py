@@ -4,7 +4,7 @@ from typing import Dict, Set
 
 from onebot_paths import setup_sys_path
 
-GA_ROOT = setup_sys_path()
+setup_sys_path()
 
 from llmcore import mykeys
 from onebot_state import (
@@ -77,11 +77,12 @@ def _parse_bool(value: str, default: bool) -> bool:
 
 
 def _resolve_path(path: str) -> str:
+    # Relative path is resolved from current working directory (runtime directory).
     if not path:
-        return GA_ROOT
+        return os.getcwd()
     if os.path.isabs(path):
         return path
-    return os.path.join(GA_ROOT, path)
+    return os.path.abspath(os.path.join(os.getcwd(), path))
 
 
 @dataclass(frozen=True)
