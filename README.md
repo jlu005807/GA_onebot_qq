@@ -5,10 +5,11 @@
 
 ## 1. 功能概览
 
-- 支持私聊与群聊（群聊需 `@机器人` 才响应）。
+- 支持私聊与群聊，可配置群聊触发模式（必须 `@` / 任意消息 / 触发词）。
 - 支持图片/语音/文件附件保存，并把附件类型与路径传给 Agent。
-- 支持管理员与普通用户身份区分，并将权限策略写入提示词。
+- 支持管理员与普通用户身份区分，并可按需注入权限策略提示词。
 - 支持按用户排队处理消息，避免并发上下文串扰。
+- 支持把触发消息前的最近 `n` 条消息作为上下文传给 GA（`n=0` 关闭）。
 - 支持断线自动重连，支持 token 鉴权。
 
 ## 2. 项目结构
@@ -26,6 +27,7 @@ onebot_qq/
 │  ├─ onebot_state.py       # 运行时状态
 │  └─ onebot_paths.py       # GenericAgent 路径注入
 ├─ .env.example
+├─ .env.example-en
 ├─ .env
 └─ README.md
 ```
@@ -54,7 +56,13 @@ cd D:\GenericAgent\temp\onebot_qq
 copy .env.example .env
 ```
 
-3. 修改 `.env`（至少确认 `ONEBOT_WS_URL`、`ONEBOT_ADMIN_QQ`、`ONEBOT_ACCESS_TOKEN`）。
+如需英文注释模板，可使用：
+
+```bash
+copy .env.example-en .env
+```
+
+3. 修改 `.env`（至少确认 `ONEBOT_WS_URL`；建议确认 `ONEBOT_GROUP_REQUIRE_AT`、`ONEBOT_GROUP_TRIGGER_WORDS`、`ONEBOT_CONTEXT_MESSAGES`）。
 
 4. 在 NapCat 中启用 OneBot v11 WebSocket（见下一节）。
 
@@ -99,7 +107,7 @@ python src/main.py
 ### 5.2 快速自检清单
 
 - 私聊机器人一句话，确认有回复。  
-- 群里 `@机器人` 发一句话，确认有回复。  
+- 群里发一句话，按你的触发策略验证可回复（`@` / 触发词 / 任意消息）。  
 - 发一张图/一段语音/一个文件，确认 `data/image|record|file` 有落盘。  
 - 若失败，先看 `temp/onebot.log` 是否出现 `retcode=1403` 或连接拒绝。  
 
@@ -112,12 +120,32 @@ python src/main.py
 | `ONEBOT_ALLOWED_USERS` | `*` | 否 | 允许使用的用户列表；`*` 表示全部。管理员总是放行。 |
 | `ONEBOT_ALLOW_GROUP` | `1` | 否 | 是否启用群聊消息处理。 |
 | `ONEBOT_ALLOWED_GROUPS` | `*` | 否 | 允许处理的群号列表；`*` 表示全部群。 |
+| `ONEBOT_GROUP_REQUIRE_AT` | 空 | 否 | 群聊触发模式。`1/true`=需 `@`（触发词也可触发）；`0/false/空`=任意消息可触发。 |
+| `ONEBOT_GROUP_TRIGGER_WORDS` | 空 | 否 | 群聊触发词，逗号分隔，命中任一即可触发回复。 |
+| `ONEBOT_CONTEXT_MESSAGES` | `0` | 否 | 向 GA 传递触发前历史消息条数。`0` 关闭，最大 `20`。 |
 | `ONEBOT_ACCESS_TOKEN` | 空 | 按需 | NapCat WS token。设置后会同时用于 Header 与 URL query。 |
 | `ONEBOT_PLAIN_TEXT_HINT` | 内置提示 | 否 | 附加给 Agent 的文本提示。设为 `0/false/off` 可关闭。 |
 | `ONEBOT_MAX_MSG_LENGTH` | `500` | 否 | 单条消息最大长度。 |
 | `ONEBOT_MAX_QUEUE_SIZE` | `5` | 否 | 每个用户的待处理队列上限。 |
 | `ONEBOT_DATA_DIR` | `data` | 否 | 附件保存目录。相对路径基于**当前运行目录**解析。 |
 | `ONEBOT_MAX_FILE_BYTES` | `10485760` | 否 | 单附件最大字节数（默认 10MB）。 |
+
+### 6.1 常用配置组合（可直接参考）
+
+1. 仅 `@机器人` 才回复（群内更克制）  
+   - `ONEBOT_GROUP_REQUIRE_AT=1`  
+   - `ONEBOT_GROUP_TRIGGER_WORDS=`  
+   - `ONEBOT_CONTEXT_MESSAGES=0`
+
+2. 任意群消息都可触发（测试联调常用）  
+   - `ONEBOT_GROUP_REQUIRE_AT=`（留空）  
+   - `ONEBOT_GROUP_TRIGGER_WORDS=`  
+   - `ONEBOT_CONTEXT_MESSAGES=0`
+
+3. `@` 或触发词触发，并附带最近 3 条上下文（推荐）  
+   - `ONEBOT_GROUP_REQUIRE_AT=1`  
+   - `ONEBOT_GROUP_TRIGGER_WORDS=小宇,助手,bot`  
+   - `ONEBOT_CONTEXT_MESSAGES=3`
 
 ## 7. 附件处理规则
 
@@ -138,7 +166,8 @@ attachment1: type=image path=D:\...\data\image\xxx.jpg size=123KB
 
 ## 8. 权限策略
 
-- 网关会识别 `管理员/非管理员` 身份并写入提示词。
+- 当配置了 `ONEBOT_ADMIN_QQ` 时，网关会识别 `管理员/非管理员` 身份并写入提示词。
+- 当 `ONEBOT_ADMIN_QQ` 为空时，不向 GA 注入管理员相关策略提示词。
 - 非管理员请求文件级/进程级/硬件级操作时，期望 Agent 拒绝并提示联系管理员。
 - 入口层不做危险关键词硬拦截，避免误伤正常对话。
 
@@ -147,7 +176,7 @@ attachment1: type=image path=D:\...\data\image\xxx.jpg size=123KB
 启动后建议按顺序验证：
 
 1. 私聊发送文本，确认可回复。
-2. 群聊 `@机器人` 发送文本，确认可回复。
+2. 群聊发送文本，按当前触发配置验证可回复。
 3. 发送图片/语音/文件，确认 `data/*` 有落盘文件。
 4. 查看回复内容，确认 Agent 能看到附件路径信息。
 
@@ -161,7 +190,8 @@ attachment1: type=image path=D:\...\data\image\xxx.jpg size=123KB
 - 检查 NapCat token 与 `ONEBOT_ACCESS_TOKEN` 是否一致。
 
 ### Q3: 群聊不回复
-- 确认消息有 `@机器人`。
+- 若 `ONEBOT_GROUP_REQUIRE_AT=1`，确认消息有 `@机器人` 或命中触发词。
+- 若希望任意群消息都触发，设置 `ONEBOT_GROUP_REQUIRE_AT=`（留空）或 `0`。
 - 确认 `ONEBOT_ALLOW_GROUP=1`。
 - 确认群号在 `ONEBOT_ALLOWED_GROUPS`（或使用 `*`）。
 
@@ -172,6 +202,10 @@ attachment1: type=image path=D:\...\data\image\xxx.jpg size=123KB
 ### Q5: 启动报 websockets 参数错误
 - 已兼容 `additional_headers/extra_headers` 差异。
 - 仍有问题时，建议升级 `websockets` 到较新版本后重试。
+
+### Q6: 为什么看不到“管理员/非管理员”策略提示？
+- 若 `ONEBOT_ADMIN_QQ` 留空，网关不会向 GA 注入管理员策略提示词（这是当前设计）。
+- 如需启用该策略，请给 `ONEBOT_ADMIN_QQ` 配置至少一个管理员 QQ。
 
 ## 11. 备注
 

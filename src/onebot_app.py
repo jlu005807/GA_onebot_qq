@@ -1,9 +1,10 @@
 import asyncio
+from collections import deque
 import inspect
 import json
 import sys
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 from onebot_paths import setup_sys_path
 
@@ -19,6 +20,7 @@ from onebot_message import (
     extract_text,
     is_transient_status_message,
     is_at_bot,
+    match_trigger_word,
     normalize_outgoing_content,
     parse_send_content,
 )
@@ -33,6 +35,8 @@ except ImportError:
 
 
 QUEUE_IDLE_SECONDS = 5
+HISTORY_MAXLEN = 40
+HISTORY_TEXT_MAXLEN = 300
 
 
 class OneBotApp(AgentChatMixin):
@@ -49,6 +53,7 @@ class OneBotApp(AgentChatMixin):
             max_file_bytes=self.config.max_file_bytes,
         )
         self._pending_calls: Dict[str, asyncio.Future] = {}
+        self._chat_histories: Dict[str, Deque[str]] = {}
 
     def _is_admin_user(self, user_id: str) -> bool:
         return user_id in self.config.admin_set
@@ -72,7 +77,7 @@ class OneBotApp(AgentChatMixin):
 
     async def send_text(self, chat_id, content, *, msg_id=None, is_group=False, **ctx):
         if not self.ws:
-            print("[OneBot] ws not connected, cannot send")
+            self._emit_log("[OneBot] ws not connected, cannot send")
             return
 
         content = normalize_outgoing_content(content or "")
@@ -106,6 +111,50 @@ class OneBotApp(AgentChatMixin):
         if user_id not in self.state.user_queues:
             self.state.user_queues[user_id] = asyncio.Queue(maxsize=self.config.max_queue_size)
         return self.state.user_queues[user_id]
+
+    def _history_key(self, chat_id: str, is_group: bool) -> str:
+        prefix = "g" if is_group else "p"
+        return f"{prefix}:{chat_id}"
+
+    def _get_or_create_history(self, key: str) -> Deque[str]:
+        history = self._chat_histories.get(key)
+        if history is None:
+            history = deque(maxlen=HISTORY_MAXLEN)
+            self._chat_histories[key] = history
+        return history
+
+    def _append_history_message(
+        self,
+        *,
+        chat_id: str,
+        is_group: bool,
+        sender_qq: str,
+        sender_nickname: str,
+        content: str,
+    ) -> None:
+        text = (content or "").replace("\r", " ").replace("\n", " ").strip()
+        if not text:
+            return
+        if len(text) > HISTORY_TEXT_MAXLEN:
+            text = text[:HISTORY_TEXT_MAXLEN] + "..."
+
+        display = sender_nickname.strip() or sender_qq
+        line = f"{display}({sender_qq}): {text}" if sender_qq else f"{display}: {text}"
+
+        key = self._history_key(chat_id, is_group)
+        history = self._get_or_create_history(key)
+        history.append(line)
+
+    def _get_recent_history_messages(
+        self, *, chat_id: str, is_group: bool, count: int
+    ) -> List[str]:
+        if count <= 0:
+            return []
+        key = self._history_key(chat_id, is_group)
+        history = self._chat_histories.get(key)
+        if not history:
+            return []
+        return list(history)[-count:]
 
     def _log_prompt_preview(self, chat_id, prompt: str, *, is_group: bool, sender_qq: str) -> None:
         one_line = (prompt or "").replace("\r", " ").replace("\n", " | ")
@@ -285,6 +334,7 @@ class OneBotApp(AgentChatMixin):
                         sender_qq,
                         sender_nickname,
                         at_mentions,
+                        history_messages,
                     ) = item
 
                     if content and content.startswith("/"):
@@ -297,9 +347,11 @@ class OneBotApp(AgentChatMixin):
                             attachments,
                             is_group=is_group,
                             is_admin=is_admin,
+                            include_admin_policy=bool(self.config.admin_set),
                             sender_nickname=sender_nickname,
                             sender_qq=sender_qq,
                             at_mentions=at_mentions,
+                            history_messages=history_messages,
                             plain_text_hint=self.config.plain_text_hint,
                         )
                         self._log_prompt_preview(
@@ -332,6 +384,7 @@ class OneBotApp(AgentChatMixin):
         msg_type = event.get("message_type")
         is_group = msg_type == "group"
         sender = event.get("sender", {})
+        sender_nickname = sender.get("nickname", "") or sender.get("card", "") or ""
 
         raw_user_id = sender.get("user_id") or event.get("user_id")
         user_id = str(raw_user_id).strip() if raw_user_id is not None else ""
@@ -339,7 +392,7 @@ class OneBotApp(AgentChatMixin):
         chat_id = group_id if is_group else user_id
 
         if not user_id:
-            print("[OneBot] missing user_id, ignore message")
+            self._emit_log("[OneBot] missing user_id, ignore message")
             return
 
         # Ignore self messages to prevent loops.
@@ -351,7 +404,7 @@ class OneBotApp(AgentChatMixin):
             if not self.config.allow_group:
                 return
             if not group_id:
-                print("[OneBot] missing group_id, ignore group message")
+                self._emit_log("[OneBot] missing group_id, ignore group message")
                 return
             if (
                 not public_access(self.config.allowed_groups)
@@ -359,17 +412,38 @@ class OneBotApp(AgentChatMixin):
             ):
                 return
             if not self._ensure_bot_qq(event):
-                print("[OneBot] cannot get bot_qq, ignoring group msg")
-                return
-            if not is_at_bot(raw_msg, self.bot_qq):
+                self._emit_log("[OneBot] cannot get bot_qq, ignoring group msg")
                 return
 
         is_admin = self._is_admin_user(user_id)
         content = extract_text(raw_msg)
 
         if not self._is_allowed_user(user_id, is_admin):
-            print(f"[OneBot] unauthorized user: {user_id}")
+            self._emit_log(f"[OneBot] unauthorized user: {user_id}")
             return
+
+        history_messages = self._get_recent_history_messages(
+            chat_id=chat_id,
+            is_group=is_group,
+            count=self.config.context_messages,
+        )
+        self._append_history_message(
+            chat_id=chat_id,
+            is_group=is_group,
+            sender_qq=user_id,
+            sender_nickname=sender_nickname,
+            content=content,
+        )
+
+        if is_group:
+            at_bot = is_at_bot(raw_msg, self.bot_qq)
+            hit_word = match_trigger_word(content, self.config.group_trigger_words)
+            if self.config.group_require_at is True and not at_bot and not hit_word:
+                return
+            if hit_word:
+                self._emit_log(
+                    f"[OneBot] group trigger matched: '{hit_word}' from user={user_id} group={group_id}"
+                )
 
         if content and len(content) > self.config.max_msg_length:
             await self.send_text(
@@ -420,7 +494,6 @@ class OneBotApp(AgentChatMixin):
         if not content and not attachments:
             return
 
-        sender_nickname = sender.get("nickname", "") or sender.get("card", "") or ""
         at_mentions = extract_at_mentions(raw_msg, self.bot_qq)
 
         try:
@@ -435,6 +508,7 @@ class OneBotApp(AgentChatMixin):
                     user_id,
                     sender_nickname,
                     at_mentions,
+                    history_messages,
                 )
             )
         except asyncio.QueueFull:

@@ -113,6 +113,20 @@ def extract_text(raw_msg: Any) -> str:
     return content.strip()
 
 
+def match_trigger_word(content: str, trigger_words: Sequence[str]) -> str:
+    text = (content or "").strip()
+    if not text or not trigger_words:
+        return ""
+    lowered = text.casefold()
+    for word in trigger_words:
+        normalized = str(word or "").strip()
+        if not normalized:
+            continue
+        if normalized.casefold() in lowered:
+            return normalized
+    return ""
+
+
 def extract_at_mentions(raw_msg: Any, bot_qq: str) -> List[str]:
     mentions: List[str] = []
     if isinstance(raw_msg, list):
@@ -179,12 +193,17 @@ def build_agent_prompt(
     *,
     is_group: bool,
     is_admin: bool,
+    include_admin_policy: bool = True,
     sender_nickname: str = "",
     sender_qq: str = "",
     at_mentions: Sequence[str] = (),
+    history_messages: Sequence[str] = (),
     plain_text_hint: str = "",
 ) -> str:
-    parts: List[str] = [f"context: group={1 if is_group else 0} admin={1 if is_admin else 0}"]
+    context_line = f"context: group={1 if is_group else 0}"
+    if include_admin_policy:
+        context_line += f" admin={1 if is_admin else 0}"
+    parts: List[str] = [context_line]
     parts.append(
         "output_rules: You are replying in QQ chat. Use plain text only; do NOT use markdown and please use Chinese. "
         "syntax, code fences, or tool-call templates (for example code_run(...), file_patch(...), "
@@ -198,6 +217,8 @@ def build_agent_prompt(
     if at_mentions:
         parts.append(f"mentioned_qq: {', '.join(at_mentions)}")
         parts.append("tip: if you need to @ someone, use [CQ:at,qq=<qq>].")
+    if history_messages:
+        parts.append("recent_messages:\n" + "\n".join(history_messages))
     if content:
         parts.append(content)
     if attachments:
@@ -205,13 +226,14 @@ def build_agent_prompt(
     if plain_text_hint:
         parts.append(plain_text_hint)
 
-    if is_admin:
-        parts.append(
-            "policy: user is admin. File/process/hardware operations are allowed with risk notice."
-        )
-    else:
-        parts.append(
-            "policy: user is NOT admin. File/process/hardware operations are forbidden. "
-            "Reject requests like directory operations, process control, and screen/CPU changes."
-        )
+    if include_admin_policy:
+        if is_admin:
+            parts.append(
+                "policy: user is admin. File/process/hardware operations are allowed with risk notice."
+            )
+        else:
+            parts.append(
+                "policy: user is NOT admin. File/process/hardware operations are forbidden. "
+                "Reject requests like directory operations, process control, and screen/CPU changes."
+            )
     return "\n\n".join(parts)

@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Dict, Set
+from typing import Dict, Optional, Set, Tuple
 
 from onebot_paths import setup_sys_path
 
@@ -12,6 +12,8 @@ from onebot_state import (
     DEFAULT_MAX_MSG_LENGTH,
     DEFAULT_MAX_QUEUE_SIZE,
 )
+
+MAX_CONTEXT_MESSAGES = 20
 
 
 def _read_dotenv(path: str) -> Dict[str, str]:
@@ -76,6 +78,31 @@ def _parse_bool(value: str, default: bool) -> bool:
     return default
 
 
+def _parse_optional_bool(value: str) -> Optional[bool]:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _parse_non_negative_int(value: str, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < 0:
+        return default
+    return parsed
+
+
+def _parse_csv_tuple(value: str) -> Tuple[str, ...]:
+    return tuple(item.strip() for item in str(value or "").split(",") if item.strip())
+
+
 def _resolve_path(path: str) -> str:
     # Relative path is resolved from current working directory (runtime directory).
     if not path:
@@ -92,6 +119,9 @@ class OneBotConfig:
     allowed_users: Set[str]
     allow_group: bool
     allowed_groups: Set[str]
+    group_require_at: Optional[bool]
+    group_trigger_words: Tuple[str, ...]
+    context_messages: int
     access_token: str
     plain_text_hint: str
     max_queue_size: int
@@ -133,6 +163,10 @@ def load_config() -> OneBotConfig:
     allow_group = _parse_bool(_get_env("ONEBOT_ALLOW_GROUP", ""), True)
     allowed_groups_raw = str(_get_env("ONEBOT_ALLOWED_GROUPS", "*")).strip()
     allowed_groups = _parse_set(allowed_groups_raw) if allowed_groups_raw else {"*"}
+    group_require_at = _parse_optional_bool(_get_env("ONEBOT_GROUP_REQUIRE_AT", ""))
+    group_trigger_words = _parse_csv_tuple(_get_env("ONEBOT_GROUP_TRIGGER_WORDS", ""))
+    context_messages = _parse_non_negative_int(_get_env("ONEBOT_CONTEXT_MESSAGES", "0"), 0)
+    context_messages = min(context_messages, MAX_CONTEXT_MESSAGES)
     max_queue_size = _parse_int(
         _get_env("ONEBOT_MAX_QUEUE_SIZE", ""), DEFAULT_MAX_QUEUE_SIZE
     )
@@ -150,6 +184,9 @@ def load_config() -> OneBotConfig:
         allowed_users=allowed_users,
         allow_group=allow_group,
         allowed_groups=allowed_groups,
+        group_require_at=group_require_at,
+        group_trigger_words=group_trigger_words,
+        context_messages=context_messages,
         access_token=access_token,
         plain_text_hint=plain_text_hint,
         max_queue_size=max_queue_size,
