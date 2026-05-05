@@ -1,6 +1,7 @@
 # onebot_qq
 
 `onebot_qq` 是一个基于 `OneBot v11` 的 QQ 机器人网关，负责把 NapCat 推送的消息转发给 `GenericAgent`，并把 Agent 回复发送回 QQ。
+本项目的github仓库位于[GA_onebot_qq](https://github.com/jlu005807/GA_onebot_qq.git),对于安装并且已经配置了GenericAgent的用户,可以直接克隆项目到GenericAgent的temp文件夹下，或者让GA仔细阅读[部署教程—SOP](https://fudankw.cn/sophub/sops/69f9806ba1d45b6c2d5f2fd0)进行完成项目克隆，配置并且安装napcat
 
 ## 1. 功能概览
 
@@ -33,7 +34,7 @@ onebot_qq/
 
 1. 必须放在 `GenericAgent/temp` 目录下运行（依赖 `agentmain.py` 路径注入）。
 2. Python 3.8+。
-3. 安装依赖：
+3. 安装依赖：注意可以和GenericAgent使用同一个虚拟环境则不再需要安装额外的依赖即可以跳过下面的一步，但是如果发现运行缺失库需要手动或者让GA进行安装
 
 ```bash
 pip install -r requirements.txt
