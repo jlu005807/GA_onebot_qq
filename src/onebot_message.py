@@ -2,11 +2,14 @@ import re
 from typing import Any, Dict, List, Sequence
 
 
-STATUS_ONLY_PATTERNS = [
-    r"^思考中[.。…]*$",
-    r"^⏳\s*还在处理中，请稍等[.。…]*$",
-    r"^还在处理中，请稍等[.。…]*$",
-]
+STATUS_ONLY_PATTERNS = (
+    re.compile(r"^思考中[.。…]*$"),
+    re.compile(r"^⏳\s*还在处理中，请稍等[.。…]*$"),
+    re.compile(r"^还在处理中，请稍等[.。…]*$"),
+)
+CQ_AT_RE = re.compile(r"\[CQ:at,qq=(\d+)\]")
+CQ_SEGMENT_RE = re.compile(r"\[CQ:[^\]]+\]")
+CQ_CODE_RE = re.compile(r"\[CQ:[^\]]+\]")
 
 
 def normalize_outgoing_content(content: str) -> str:
@@ -61,7 +64,7 @@ def is_transient_status_message(content: str) -> bool:
     if not text:
         return True
     for pattern in STATUS_ONLY_PATTERNS:
-        if re.match(pattern, text):
+        if pattern.match(text):
             return True
     return False
 
@@ -69,7 +72,7 @@ def is_transient_status_message(content: str) -> bool:
 def parse_send_content(text: str) -> List[Dict[str, Any]]:
     segments: List[Dict[str, Any]] = []
     last_end = 0
-    for match in re.finditer(r"\[CQ:at,qq=(\d+)\]", text or ""):
+    for match in CQ_AT_RE.finditer(text or ""):
         if match.start() > last_end:
             pre_text = text[last_end : match.start()]
             if pre_text:
@@ -109,7 +112,7 @@ def extract_text(raw_msg: Any) -> str:
         content = str(raw_msg)
 
     if "[CQ:" in content:
-        content = re.sub(r"\[CQ:[^\]]+\]", "", content)
+        content = CQ_CODE_RE.sub("", content)
     return content.strip()
 
 
@@ -136,7 +139,7 @@ def extract_at_mentions(raw_msg: Any, bot_qq: str) -> List[str]:
                 if qq and qq != bot_qq and qq != "all":
                     mentions.append(qq)
     elif isinstance(raw_msg, str):
-        for match in re.finditer(r"\[CQ:at,qq=(\d+)\]", raw_msg):
+        for match in CQ_AT_RE.finditer(raw_msg):
             qq = match.group(1)
             if qq != bot_qq:
                 mentions.append(qq)
@@ -154,7 +157,7 @@ def extract_segments(raw_msg: Any) -> List[Dict[str, Any]]:
 
 def _parse_cq_segments(raw_msg: str) -> List[Dict[str, Any]]:
     segments: List[Dict[str, Any]] = []
-    for code in re.findall(r"\[CQ:[^\]]+\]", raw_msg):
+    for code in CQ_SEGMENT_RE.findall(raw_msg):
         seg = _parse_cq_segment(code)
         if seg:
             segments.append(seg)

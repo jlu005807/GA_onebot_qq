@@ -11,6 +11,7 @@
 - 支持按用户排队处理消息，避免并发上下文串扰。
 - 支持把触发消息前的最近 `n` 条消息作为上下文传给 GA（`n=0` 关闭）。
 - 支持断线自动重连，支持 token 鉴权。
+- 支持 Windows / Linux 双平台运行（含 `.venv` 路径自动兼容）。
 
 ## 2. 项目结构
 
@@ -36,7 +37,8 @@ onebot_qq/
 
 1. 必须放在 `GenericAgent/temp` 目录下运行（依赖 `agentmain.py` 路径注入）。
 2. Python 3.8+。
-3. 安装依赖：注意可以和GenericAgent使用同一个虚拟环境则不再需要安装额外的依赖即可以跳过下面的一步，但是如果发现运行缺失库需要手动或者让GA进行安装
+3. 支持系统：Windows / Linux（代码已兼容两端路径差异）。
+4. 安装依赖：注意可以和GenericAgent使用同一个虚拟环境则不再需要安装额外的依赖即可以跳过下面的一步，但是如果发现运行缺失库需要手动或者让GA进行安装
 
 ```bash
 pip install -r requirements.txt
@@ -47,19 +49,31 @@ pip install -r requirements.txt
 1. 进入项目目录：
 
 ```bash
+# Windows
 cd D:\GenericAgent\temp\onebot_qq
+
+# Linux
+cd ~/GenericAgent/temp/onebot_qq
 ```
 
 2. 复制配置模板：
 
 ```bash
+# Windows
 copy .env.example .env
+
+# Linux
+cp .env.example .env
 ```
 
 如需英文注释模板，可使用：
 
 ```bash
+# Windows
 copy .env.example-en .env
+
+# Linux
+cp .env.example-en .env
 ```
 
 3. 修改 `.env`（至少确认 `ONEBOT_WS_URL`；建议确认 `ONEBOT_GROUP_REQUIRE_AT`、`ONEBOT_GROUP_TRIGGER_WORDS`、`ONEBOT_CONTEXT_MESSAGES`）。
@@ -69,7 +83,11 @@ copy .env.example-en .env
 5. 启动：
 
 ```bash
+# Windows
 python src/main.py
+
+# Linux（若系统默认 python 指向 Python2，请使用 python3）
+python3 src/main.py
 ```
 
 ## 5. NapCat 配置说明（重点）
@@ -162,6 +180,8 @@ python src/main.py
 
 ```text
 attachment1: type=image path=D:\...\data\image\xxx.jpg size=123KB
+# Linux 示例：
+# attachment1: type=image path=/home/you/GenericAgent/temp/onebot_qq/data/image/xxx.jpg size=123KB
 ```
 
 ## 8. 权限策略
@@ -206,6 +226,10 @@ attachment1: type=image path=D:\...\data\image\xxx.jpg size=123KB
 ### Q6: 为什么看不到“管理员/非管理员”策略提示？
 - 若 `ONEBOT_ADMIN_QQ` 留空，网关不会向 GA 注入管理员策略提示词（这是当前设计）。
 - 如需启用该策略，请给 `ONEBOT_ADMIN_QQ` 配置至少一个管理员 QQ。
+
+### Q7: Linux 下启动后提示找不到依赖或模块？
+- 优先确认是否在 `GenericAgent` 的虚拟环境中运行。
+- 已兼容 `.venv/Lib/site-packages`（Windows）和 `.venv/lib/python*/site-packages`（Linux）自动注入。
 
 ## 11. 备注
 

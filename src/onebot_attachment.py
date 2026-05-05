@@ -10,6 +10,11 @@ from urllib.parse import unquote, urlparse
 from onebot_async import run_in_thread
 
 ATTACHMENT_TYPES = {"image", "record", "file"}
+DEFAULT_EXTENSIONS = {
+    "image": ".jpg",
+    "record": ".silk",
+    "file": ".bin",
+}
 
 
 class OneBotAttachmentManager:
@@ -40,6 +45,9 @@ class OneBotAttachmentManager:
             base = "file"
         suffix = uuid.uuid4().hex[:8]
         return f"{base}_{suffix}{ext}"
+
+    def _default_extension(self, seg_type: str) -> str:
+        return DEFAULT_EXTENSIONS.get(seg_type, ".bin")
 
     def _get_segment_url(self, data: Dict[str, Any]) -> str:
         url = str(data.get("url", "")).strip()
@@ -149,7 +157,7 @@ class OneBotAttachmentManager:
         self, seg_type: str, url: str, name_hint: str
     ) -> Optional[Dict[str, Any]]:
         save_dir = self.data_dirs.get(seg_type, self.data_dir)
-        default_ext = ".jpg" if seg_type == "image" else ".silk" if seg_type == "record" else ".bin"
+        default_ext = self._default_extension(seg_type)
         filename = self._build_filename(name_hint, url, default_ext)
         dest_path = os.path.join(save_dir, filename)
         size = await run_in_thread(self._download_file_sync, url, dest_path)
@@ -161,9 +169,7 @@ class OneBotAttachmentManager:
         self, seg_type: str, source_path: str, name_hint: str
     ) -> Optional[Dict[str, Any]]:
         save_dir = self.data_dirs.get(seg_type, self.data_dir)
-        default_ext = os.path.splitext(source_path)[1] or (
-            ".silk" if seg_type == "record" else ".bin"
-        )
+        default_ext = os.path.splitext(source_path)[1] or self._default_extension(seg_type)
         filename = self._build_filename(name_hint, source_path, default_ext)
         dest_path = os.path.join(save_dir, filename)
         size = await run_in_thread(self._copy_local_file_sync, source_path, dest_path)
@@ -175,7 +181,7 @@ class OneBotAttachmentManager:
         self, seg_type: str, payload: str, name_hint: str
     ) -> Optional[Dict[str, Any]]:
         save_dir = self.data_dirs.get(seg_type, self.data_dir)
-        default_ext = ".jpg" if seg_type == "image" else ".silk" if seg_type == "record" else ".bin"
+        default_ext = self._default_extension(seg_type)
         filename = self._build_filename(name_hint, "", default_ext)
         dest_path = os.path.join(save_dir, filename)
         size = await run_in_thread(self._save_base64_sync, payload, dest_path)
@@ -189,10 +195,12 @@ class OneBotAttachmentManager:
         attachments: List[Dict[str, Any]] = []
         errors: List[str] = []
         for seg in segments:
+            if not isinstance(seg, dict):
+                continue
             seg_type = str(seg.get("type", "")).strip()
             if seg_type not in ATTACHMENT_TYPES:
                 continue
-            data = seg.get("data", {}) if isinstance(seg, dict) else {}
+            data = seg.get("data", {})
             if not isinstance(data, dict):
                 data = {}
             name_hint = str(data.get("name") or data.get("file") or "").strip()

@@ -37,6 +37,9 @@ except ImportError:
 QUEUE_IDLE_SECONDS = 5
 HISTORY_MAXLEN = 40
 HISTORY_TEXT_MAXLEN = 300
+ADMIN_COMMANDS = {"/stop", "/new", "/restore", "/continue"}
+SEND_GROUP_ACTION = "send_group_msg"
+SEND_PRIVATE_ACTION = "send_private_msg"
 
 
 class OneBotApp(AgentChatMixin):
@@ -83,7 +86,7 @@ class OneBotApp(AgentChatMixin):
         content = normalize_outgoing_content(content or "")
         if not content or is_transient_status_message(content):
             return
-        action = "send_group_msg" if is_group else "send_private_msg"
+        action = SEND_GROUP_ACTION if is_group else SEND_PRIVATE_ACTION
 
         for part in split_text(content, self.split_limit):
             params = {"group_id": int(chat_id)} if is_group else {"user_id": int(chat_id)}
@@ -111,6 +114,14 @@ class OneBotApp(AgentChatMixin):
         if user_id not in self.state.user_queues:
             self.state.user_queues[user_id] = asyncio.Queue(maxsize=self.config.max_queue_size)
         return self.state.user_queues[user_id]
+
+    async def _send_queue_full(self, chat_id: str, *, msg_id: Any, is_group: bool) -> None:
+        await self.send_text(
+            chat_id,
+            f"[OneBot] Queue is full ({self.config.max_queue_size}). Please wait.",
+            msg_id=msg_id,
+            is_group=is_group,
+        )
 
     def _history_key(self, chat_id: str, is_group: bool) -> str:
         prefix = "g" if is_group else "p"
@@ -235,6 +246,21 @@ class OneBotApp(AgentChatMixin):
             source["file"] = f"base64://{base64_data}"
         return source
 
+    async def _try_hydrate_source(
+        self,
+        data: Dict[str, Any],
+        *,
+        action: str,
+        params: Dict[str, Any],
+        timeout: float,
+    ) -> bool:
+        resp = await self._call_action(action, params, timeout=timeout)
+        source = self._extract_source_fields(resp)
+        if not source:
+            return False
+        data.update(source)
+        return True
+
     async def _hydrate_file_segment(
         self, data: Dict[str, Any], *, is_group: bool, group_id: str, user_id: str
     ) -> Dict[str, Any]:
@@ -256,38 +282,42 @@ class OneBotApp(AgentChatMixin):
                     url_params = {"file_id": file_id, **group_params}
                     if busid:
                         url_params["busid"] = busid
-                    resp = await self._call_action(
-                        "get_group_file_url",
-                        url_params,
+                    hydrated = await self._try_hydrate_source(
+                        data,
+                        action="get_group_file_url",
+                        params=url_params,
                         timeout=5.0,
                     )
-                    source = self._extract_source_fields(resp)
-                    if source:
-                        data.update(source)
+                    if hydrated:
                         return data
             elif user_id:
                 for private_params in ({"file_id": file_id}, {"user_id": user_id, "file_id": file_id}):
-                    resp = await self._call_action(
-                        "get_private_file_url",
-                        private_params,
+                    hydrated = await self._try_hydrate_source(
+                        data,
+                        action="get_private_file_url",
+                        params=private_params,
                         timeout=5.0,
                     )
-                    source = self._extract_source_fields(resp)
-                    if source:
-                        data.update(source)
+                    if hydrated:
                         return data
 
         # 2) 再通过 get_file 拉本地路径或链接
         for file_id in identifiers:
-            resp = await self._call_action("get_file", {"file_id": file_id}, timeout=6.0)
-            source = self._extract_source_fields(resp)
-            if source:
-                data.update(source)
+            hydrated = await self._try_hydrate_source(
+                data,
+                action="get_file",
+                params={"file_id": file_id},
+                timeout=6.0,
+            )
+            if hydrated:
                 return data
-            resp = await self._call_action("get_file", {"file": file_id}, timeout=6.0)
-            source = self._extract_source_fields(resp)
-            if source:
-                data.update(source)
+            hydrated = await self._try_hydrate_source(
+                data,
+                action="get_file",
+                params={"file": file_id},
+                timeout=6.0,
+            )
+            if hydrated:
                 return data
 
         return data
@@ -456,8 +486,7 @@ class OneBotApp(AgentChatMixin):
 
         if content and content.startswith("/"):
             cmd = content.split()[0].lower()
-            admin_cmds = ["/stop", "/new", "/restore", "/continue"]
-            if cmd in admin_cmds and not is_admin:
+            if cmd in ADMIN_COMMANDS and not is_admin:
                 await self.send_text(
                     chat_id,
                     "[OneBot] This command is admin-only.",
@@ -470,12 +499,7 @@ class OneBotApp(AgentChatMixin):
 
         queue = self._get_or_create_queue(user_id)
         if queue.full():
-            await self.send_text(
-                chat_id,
-                f"[OneBot] Queue is full ({self.config.max_queue_size}). Please wait.",
-                msg_id=message_id,
-                is_group=is_group,
-            )
+            await self._send_queue_full(chat_id, msg_id=message_id, is_group=is_group)
             return
 
         segments = extract_segments(raw_msg)
@@ -513,12 +537,7 @@ class OneBotApp(AgentChatMixin):
             )
         except asyncio.QueueFull:
             cleanup_attachments(attachments)
-            await self.send_text(
-                chat_id,
-                f"[OneBot] Queue is full ({self.config.max_queue_size}). Please wait.",
-                msg_id=message_id,
-                is_group=is_group,
-            )
+            await self._send_queue_full(chat_id, msg_id=message_id, is_group=is_group)
             return
 
         if user_id not in self.state.processing_users:
