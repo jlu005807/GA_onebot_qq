@@ -127,7 +127,7 @@ python3 src/main.py
 - 私聊机器人一句话，确认有回复。  
 - 群里发一句话，按你的触发策略验证可回复（`@` / 触发词 / 任意消息）。  
 - 发一张图/一段语音/一个文件，确认 `data/image|record|file` 有落盘。  
-- 若失败，先看 `temp/onebot.log` 是否出现 `retcode=1403` 或连接拒绝。  
+- 若失败，先看 `temp/onebot_YYYYMMDD_HHMMSS.log` 是否出现 `retcode=1403` 或连接拒绝（每次启动会生成新的时间戳日志）。  
 
 ## 6. .env 配置详解
 
