@@ -1,6 +1,9 @@
 import asyncio
 import inspect
 import json
+import sys
+import uuid
+from typing import Any, Dict, Optional
 
 from onebot_paths import setup_sys_path
 
@@ -14,6 +17,7 @@ from onebot_message import (
     extract_at_mentions,
     extract_segments,
     extract_text,
+    is_transient_status_message,
     is_at_bot,
     normalize_outgoing_content,
     parse_send_content,
@@ -44,6 +48,7 @@ class OneBotApp(AgentChatMixin):
             data_dir=self.config.data_dir,
             max_file_bytes=self.config.max_file_bytes,
         )
+        self._pending_calls: Dict[str, asyncio.Future] = {}
 
     def _is_admin_user(self, user_id: str) -> bool:
         return user_id in self.config.admin_set
@@ -62,7 +67,7 @@ class OneBotApp(AgentChatMixin):
         if not self_id:
             return False
         self.bot_qq = str(self_id)
-        print(f"[OneBot] Bot QQ: {self.bot_qq}")
+        self._emit_log(f"[OneBot] Bot QQ: {self.bot_qq}")
         return True
 
     async def send_text(self, chat_id, content, *, msg_id=None, is_group=False, **ctx):
@@ -71,6 +76,8 @@ class OneBotApp(AgentChatMixin):
             return
 
         content = normalize_outgoing_content(content or "")
+        if not content or is_transient_status_message(content):
+            return
         action = "send_group_msg" if is_group else "send_private_msg"
 
         for part in split_text(content, self.split_limit):
@@ -93,12 +100,166 @@ class OneBotApp(AgentChatMixin):
             try:
                 await self.ws.send(json.dumps(payload))
             except Exception as exc:
-                print(f"[OneBot] send error: {exc}")
+                self._emit_log(f"[OneBot] send error: {exc}")
 
     def _get_or_create_queue(self, user_id: str) -> asyncio.Queue:
         if user_id not in self.state.user_queues:
             self.state.user_queues[user_id] = asyncio.Queue(maxsize=self.config.max_queue_size)
         return self.state.user_queues[user_id]
+
+    def _log_prompt_preview(self, chat_id, prompt: str, *, is_group: bool, sender_qq: str) -> None:
+        one_line = (prompt or "").replace("\r", " ").replace("\n", " | ")
+        if len(one_line) > 600:
+            one_line = one_line[:600] + "...(truncated)"
+        self._emit_log(
+            f"[OneBot->GA] chat={chat_id} group={1 if is_group else 0} sender={sender_qq} prompt={one_line}"
+        )
+
+    def _emit_log(self, message: str) -> None:
+        print(message)
+        real_stdout = getattr(sys, "__stdout__", None)
+        if real_stdout and real_stdout is not sys.stdout:
+            try:
+                real_stdout.write(message + "\n")
+                real_stdout.flush()
+            except Exception:
+                pass
+
+    async def _call_action(
+        self, action: str, params: Dict[str, Any], timeout: float = 8.0
+    ) -> Optional[Dict[str, Any]]:
+        if not self.ws:
+            return None
+        echo = f"call_{uuid.uuid4().hex}"
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_calls[echo] = fut
+        payload = {"action": action, "params": params, "echo": echo}
+        try:
+            await self.ws.send(json.dumps(payload))
+            result = await asyncio.wait_for(fut, timeout=timeout)
+            if isinstance(result, dict):
+                return result
+            return None
+        except Exception:
+            return None
+        finally:
+            self._pending_calls.pop(echo, None)
+
+    def _segment_has_source(self, data: Dict[str, Any]) -> bool:
+        url = str(data.get("url", "")).strip()
+        if url.startswith("http://") or url.startswith("https://"):
+            return True
+        path = str(data.get("path", "")).strip()
+        if path:
+            return True
+        file_ref = str(data.get("file", "")).strip()
+        if file_ref:
+            if file_ref.startswith("http://") or file_ref.startswith("https://"):
+                return True
+            if file_ref.startswith("base64://") or file_ref.startswith("data:"):
+                return True
+            if len(file_ref) > 2 and (":\\" in file_ref or file_ref.startswith("/")):
+                return True
+        base64_data = str(data.get("base64", "")).strip()
+        if base64_data:
+            return True
+        return False
+
+    def _extract_source_fields(self, resp: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(resp, dict):
+            return {}
+        if resp.get("status") != "ok":
+            return {}
+        payload = resp.get("data")
+        if isinstance(payload, str):
+            return {"file": payload}
+        if not isinstance(payload, dict):
+            return {}
+        source: Dict[str, Any] = {}
+        for key in ("url", "file", "path", "file_name", "file_size"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                source[key] = value
+        base64_data = payload.get("base64")
+        if base64_data:
+            source["file"] = f"base64://{base64_data}"
+        return source
+
+    async def _hydrate_file_segment(
+        self, data: Dict[str, Any], *, is_group: bool, group_id: str, user_id: str
+    ) -> Dict[str, Any]:
+        if self._segment_has_source(data):
+            return data
+
+        identifiers = []
+        for key in ("file_id", "id", "fid", "file"):
+            value = str(data.get(key, "")).strip()
+            if value and value not in identifiers:
+                identifiers.append(value)
+
+        # 1) 先拿直链（NapCat 文件处理建议）
+        for file_id in identifiers:
+            if is_group and group_id:
+                group_param_candidates = [{"group_id": group_id}, {"group": group_id}]
+                busid = str(data.get("busid", "")).strip()
+                for group_params in group_param_candidates:
+                    url_params = {"file_id": file_id, **group_params}
+                    if busid:
+                        url_params["busid"] = busid
+                    resp = await self._call_action(
+                        "get_group_file_url",
+                        url_params,
+                        timeout=5.0,
+                    )
+                    source = self._extract_source_fields(resp)
+                    if source:
+                        data.update(source)
+                        return data
+            elif user_id:
+                for private_params in ({"file_id": file_id}, {"user_id": user_id, "file_id": file_id}):
+                    resp = await self._call_action(
+                        "get_private_file_url",
+                        private_params,
+                        timeout=5.0,
+                    )
+                    source = self._extract_source_fields(resp)
+                    if source:
+                        data.update(source)
+                        return data
+
+        # 2) 再通过 get_file 拉本地路径或链接
+        for file_id in identifiers:
+            resp = await self._call_action("get_file", {"file_id": file_id}, timeout=6.0)
+            source = self._extract_source_fields(resp)
+            if source:
+                data.update(source)
+                return data
+            resp = await self._call_action("get_file", {"file": file_id}, timeout=6.0)
+            source = self._extract_source_fields(resp)
+            if source:
+                data.update(source)
+                return data
+
+        return data
+
+    async def _hydrate_attachment_segments(
+        self, segments, *, is_group: bool, group_id: str, user_id: str
+    ):
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            seg_type = str(seg.get("type", "")).strip()
+            if seg_type != "file":
+                continue
+            data = seg.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            updated = await self._hydrate_file_segment(
+                data, is_group=is_group, group_id=group_id, user_id=user_id
+            )
+            seg["data"] = updated
+        return segments
 
     async def _process_user_queue(self, user_id: str) -> None:
         queue = self.state.user_queues.get(user_id)
@@ -141,12 +302,18 @@ class OneBotApp(AgentChatMixin):
                             at_mentions=at_mentions,
                             plain_text_hint=self.config.plain_text_hint,
                         )
+                        self._log_prompt_preview(
+                            chat_id,
+                            prompt,
+                            is_group=is_group,
+                            sender_qq=sender_qq,
+                        )
                         await self.run_agent(
                             chat_id, prompt, msg_id=message_id, is_group=is_group
                         )
                     await asyncio.sleep(1)
                 except Exception as exc:
-                    print(f"[OneBot] queue item error: {exc}")
+                    self._emit_log(f"[OneBot] queue item error: {exc}")
                 finally:
                     queue.task_done()
         finally:
@@ -238,6 +405,9 @@ class OneBotApp(AgentChatMixin):
             return
 
         segments = extract_segments(raw_msg)
+        segments = await self._hydrate_attachment_segments(
+            segments, is_group=is_group, group_id=group_id, user_id=user_id
+        )
         attachments, errors = await self.attachment_manager.download_attachments(segments)
         if errors:
             await self.send_text(
@@ -298,7 +468,7 @@ class OneBotApp(AgentChatMixin):
 
         while True:
             try:
-                print(f"[OneBot] connecting to {display_url} ...")
+                self._emit_log(f"[OneBot] connecting to {display_url} ...")
                 connect_kwargs = {
                     "ping_interval": 20,
                     "ping_timeout": 60,
@@ -308,7 +478,7 @@ class OneBotApp(AgentChatMixin):
                     connect_kwargs[header_arg] = headers
                 async with websockets.connect(connect_url, **connect_kwargs) as ws:
                     self.ws = ws
-                    print("[OneBot] connected!")
+                    self._emit_log("[OneBot] connected!")
 
                     heartbeat_task = asyncio.create_task(self._heartbeat())
                     try:
@@ -316,14 +486,21 @@ class OneBotApp(AgentChatMixin):
                             try:
                                 event = json.loads(raw_msg)
                             except json.JSONDecodeError:
-                                print(f"[OneBot] invalid JSON: {raw_msg[:200]}")
+                                self._emit_log(f"[OneBot] invalid JSON: {raw_msg[:200]}")
+                                continue
+
+                            echo = event.get("echo")
+                            if echo and echo in self._pending_calls:
+                                fut = self._pending_calls.get(echo)
+                                if fut and not fut.done():
+                                    fut.set_result(event)
                                 continue
 
                             if event.get("post_type") == "meta_event":
                                 continue
 
                             if event.get("retcode") == 1403:
-                                print(
+                                self._emit_log(
                                     "[OneBot] token verification failed. Check NapCat access_token and ONEBOT_ACCESS_TOKEN."
                                 )
                                 await ws.close()
@@ -332,15 +509,19 @@ class OneBotApp(AgentChatMixin):
                             asyncio.create_task(self.handle_event(event))
                     finally:
                         heartbeat_task.cancel()
+                        for fut in list(self._pending_calls.values()):
+                            if fut and not fut.done():
+                                fut.set_exception(RuntimeError("websocket disconnected"))
+                        self._pending_calls.clear()
                         self.ws = None
             except websockets.exceptions.ConnectionClosed as exc:
-                print(f"[OneBot] connection closed: {exc}")
+                self._emit_log(f"[OneBot] connection closed: {exc}")
             except ConnectionRefusedError:
-                print("[OneBot] connection refused, is NapCat running?")
+                self._emit_log("[OneBot] connection refused, is NapCat running?")
             except Exception as exc:
-                print(f"[OneBot] error: {exc}")
+                self._emit_log(f"[OneBot] error: {exc}")
 
-            print("[OneBot] reconnect in 5s...")
+            self._emit_log("[OneBot] reconnect in 5s...")
             await asyncio.sleep(5)
 
     async def _heartbeat(self):

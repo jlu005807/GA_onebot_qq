@@ -2,13 +2,68 @@ import re
 from typing import Any, Dict, List, Sequence
 
 
+STATUS_ONLY_PATTERNS = [
+    r"^思考中[.。…]*$",
+    r"^⏳\s*还在处理中，请稍等[.。…]*$",
+    r"^还在处理中，请稍等[.。…]*$",
+]
+
+
 def normalize_outgoing_content(content: str) -> str:
     if not content:
         return ""
-    lines = content.split("\n")
-    if lines and re.match(r"^LLM Running \(Turn \d+\) \.\.\.", lines[0]):
-        return "\n".join(lines[1:]).lstrip()
-    return content
+    text = content.replace("\r\n", "\n")
+    lines = text.split("\n")
+
+    filtered: List[str] = []
+    in_tool_block = False
+    for line in lines:
+        stripped = line.strip()
+
+        # Drop assistant status templates such as:
+        # "LLM Running (Turn 2) ..."
+        if re.match(r"^LLM Running \(Turn \d+\) \.\.\.$", stripped):
+            continue
+
+        # Drop tool-call templates such as:
+        # "code_run({...})" or lines prefixed with symbols.
+        if not in_tool_block and "code_run(" in stripped:
+            in_tool_block = True
+            if stripped.endswith(")") or stripped.endswith("})"):
+                in_tool_block = False
+            continue
+        if in_tool_block:
+            if stripped.endswith(")") or stripped.endswith("})"):
+                in_tool_block = False
+            continue
+
+        # Remove markdown code-fence markers.
+        if stripped in {"```", "```text", "```markdown", "```md"}:
+            continue
+
+        filtered.append(line)
+
+    # Collapse excessive blank lines and trim.
+    compact: List[str] = []
+    previous_blank = False
+    for line in filtered:
+        is_blank = line.strip() == ""
+        if is_blank and previous_blank:
+            continue
+        compact.append(line)
+        previous_blank = is_blank
+
+    return "\n".join(compact).strip()
+
+
+def is_transient_status_message(content: str) -> bool:
+    text = (content or "").strip()
+    if not text:
+        return True
+    for pattern in STATUS_ONLY_PATTERNS:
+        if re.match(pattern, text):
+            return True
+    return False
 
 
 def parse_send_content(text: str) -> List[Dict[str, Any]]:
@@ -130,6 +185,11 @@ def build_agent_prompt(
     plain_text_hint: str = "",
 ) -> str:
     parts: List[str] = [f"context: group={1 if is_group else 0} admin={1 if is_admin else 0}"]
+    parts.append(
+        "output_rules: You are replying in QQ chat. Use plain text only; do NOT use markdown and please use Chinese. "
+        "syntax, code fences, or tool-call templates (for example code_run(...), file_patch(...), "
+        "or lines like LLM Running (Turn N) ...)."
+    )
     if sender_qq:
         sender_line = f"sender_qq: {sender_qq}"
         if sender_nickname:

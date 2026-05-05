@@ -5,7 +5,7 @@ import shutil
 import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from onebot_async import run_in_thread
 
@@ -51,13 +51,30 @@ class OneBotAttachmentManager:
         return ""
 
     def _get_local_source(self, data: Dict[str, Any]) -> str:
-        path = str(data.get("path", "")).strip()
+        path = self._normalize_local_path(str(data.get("path", "")).strip())
         if path and os.path.isfile(path):
             return path
-        file_ref = str(data.get("file", "")).strip()
+        file_ref = self._normalize_local_path(str(data.get("file", "")).strip())
         if file_ref and os.path.isfile(file_ref):
             return file_ref
         return ""
+
+    def _normalize_local_path(self, value: str) -> str:
+        raw = (value or "").strip().strip('"').strip("'")
+        if not raw:
+            return ""
+
+        if raw.startswith("file://"):
+            parsed = urlparse(raw)
+            candidate = unquote(parsed.path or "")
+            # file:///C:/path -> C:/path
+            if re.match(r"^/[A-Za-z]:/", candidate):
+                candidate = candidate[1:]
+            # Unix-style absolute path for Windows drive path.
+            candidate = candidate.replace("/", os.sep)
+            return os.path.normpath(candidate)
+
+        return os.path.normpath(raw)
 
     def _extract_base64_payload(self, data: Dict[str, Any]) -> str:
         file_ref = str(data.get("file", "")).strip()
