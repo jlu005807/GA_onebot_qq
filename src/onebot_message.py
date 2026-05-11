@@ -7,9 +7,33 @@ STATUS_ONLY_PATTERNS = (
     re.compile(r"^⏳\s*还在处理中，请稍等[.。…]*$"),
     re.compile(r"^还在处理中，请稍等[.。…]*$"),
 )
+LLM_RUNNING_RE = re.compile(
+    r"^(?:[^\w\s]*\s*)?LLM\s+Running\s*\(Turn\s+\d+\)\s*(?:\.{3}|…)$",
+    re.IGNORECASE,
+)
+TOOL_CALL_RE = re.compile(
+    r"^(?:[^\w\s]*\s*)?"
+    r"(?:(?:code_run|file_read|file_write|file_patch|shell_command|apply_patch)"
+    r"|(?:(?:functions|web|multi_tool_use)\.(?:shell_command|apply_patch|run|parallel)))"
+    r"\s*\(",
+)
+CODE_FENCE_RE = re.compile(r"^```[\w.+-]*\s*$")
 CQ_AT_RE = re.compile(r"\[CQ:at,qq=(\d+)\]")
 CQ_SEGMENT_RE = re.compile(r"\[CQ:[^\]]+\]")
-CQ_CODE_RE = re.compile(r"\[CQ:[^\]]+\]")
+
+
+def _is_status_line(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if LLM_RUNNING_RE.match(stripped):
+        return True
+    return any(pattern.match(stripped) for pattern in STATUS_ONLY_PATTERNS)
+
+
+def _is_tool_block_end(text: str) -> bool:
+    stripped = (text or "").strip().rstrip(";")
+    return stripped.endswith((")", "})", "])"))
 
 
 def normalize_outgoing_content(content: str) -> str:
@@ -23,25 +47,24 @@ def normalize_outgoing_content(content: str) -> str:
     for line in lines:
         stripped = line.strip()
 
-        # Drop assistant status templates such as:
-        # "LLM Running (Turn 2) ..."
-        if re.match(r"^LLM Running \(Turn \d+\) \.\.\.$", stripped):
+        # Drop assistant status/progress templates wherever they appear.
+        if _is_status_line(stripped):
             continue
 
         # Drop tool-call templates such as:
-        # "code_run({...})" or lines prefixed with symbols.
-        if not in_tool_block and "code_run(" in stripped:
+        # "code_run({...})", "file_read({...})", or lines prefixed with symbols.
+        if not in_tool_block and TOOL_CALL_RE.match(stripped):
             in_tool_block = True
-            if stripped.endswith(")") or stripped.endswith("})"):
+            if _is_tool_block_end(stripped):
                 in_tool_block = False
             continue
         if in_tool_block:
-            if stripped.endswith(")") or stripped.endswith("})"):
+            if _is_tool_block_end(stripped):
                 in_tool_block = False
             continue
 
         # Remove markdown code-fence markers.
-        if stripped in {"```", "```text", "```markdown", "```md"}:
+        if CODE_FENCE_RE.match(stripped):
             continue
 
         filtered.append(line)
@@ -63,10 +86,7 @@ def is_transient_status_message(content: str) -> bool:
     text = (content or "").strip()
     if not text:
         return True
-    for pattern in STATUS_ONLY_PATTERNS:
-        if pattern.match(text):
-            return True
-    return False
+    return _is_status_line(text)
 
 
 def parse_send_content(text: str) -> List[Dict[str, Any]]:
@@ -112,7 +132,7 @@ def extract_text(raw_msg: Any) -> str:
         content = str(raw_msg)
 
     if "[CQ:" in content:
-        content = CQ_CODE_RE.sub("", content)
+        content = CQ_SEGMENT_RE.sub("", content)
     return content.strip()
 
 
@@ -209,7 +229,7 @@ def build_agent_prompt(
     parts: List[str] = [context_line]
     parts.append(
         "output_rules: You are replying in QQ chat. Use plain text only; do NOT use markdown and please use Chinese. "
-        "syntax, code fences, or tool-call templates (for example code_run(...), file_patch(...), "
+        "syntax, code fences, or tool-call templates (for example code_run(...), file_read(...), file_patch(...), "
         "or lines like LLM Running (Turn N) ...)."
     )
     if sender_qq:
