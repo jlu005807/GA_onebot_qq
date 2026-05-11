@@ -14,6 +14,7 @@ LLM_RUNNING_RE = re.compile(
 TOOL_CALL_RE = re.compile(
     r"^(?:[^\w\s]*\s*)?"
     r"(?:(?:code_run|file_read|file_write|file_patch|shell_command|apply_patch)"
+    r"|(?:web_(?:scan|search|open|click|fetch|find|query|screenshot))"
     r"|(?:(?:functions|web|multi_tool_use)\.(?:shell_command|apply_patch|run|parallel)))"
     r"\s*\(",
 )
@@ -229,7 +230,7 @@ def build_agent_prompt(
     parts: List[str] = [context_line]
     parts.append(
         "output_rules: You are replying in QQ chat. Use plain text only; do NOT use markdown and please use Chinese. "
-        "syntax, code fences, or tool-call templates (for example code_run(...), file_read(...), file_patch(...), "
+        "syntax, code fences, or tool-call templates (for example code_run(...), web_scan(...), file_read(...), file_patch(...), "
         "or lines like LLM Running (Turn N) ...)."
     )
     if sender_qq:
