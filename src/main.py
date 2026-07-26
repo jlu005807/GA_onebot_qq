@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import threading
 from datetime import datetime
@@ -58,7 +59,9 @@ async def _serve(app: OneBotApp) -> None:
     except asyncio.CancelledError:
         pass
     finally:
-        await app.aclose()
+        # 本协程可能正处于被取消状态，清理属于尽力而为，不能让它再抛出来
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await app.aclose()
 
 
 def run() -> None:

@@ -87,7 +87,7 @@ class OneBotApp(AgentChatMixin):
         if exc is not None:
             self._emit_log(f"[OneBot] background task failed: {exc!r}")
 
-    def _spawn(self, coro, *, name: Optional[str] = None) -> "asyncio.Task[Any]":
+    def _spawn(self, coro) -> "asyncio.Task[Any]":
         return self._track(asyncio.ensure_future(coro))
 
     def _is_admin_user(self, user_id: str) -> bool:
