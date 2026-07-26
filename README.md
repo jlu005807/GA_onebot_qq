@@ -6,12 +6,13 @@
 ## 1. 功能概览
 
 - 支持私聊与群聊，可配置群聊触发模式（必须 `@` / 任意消息 / 触发词）。
-- 支持图片/语音/文件附件保存，并把附件类型与路径传给 Agent。
+- 支持图片/语音/文件附件保存，并把附件类型与路径传给 Agent；附件按保留期自动清理。
 - 支持管理员与普通用户身份区分，并可按需注入权限策略提示词。
-- 支持按用户排队处理消息，避免并发上下文串扰。
+- 按用户串行排队处理消息，同一用户的消息不会并发交给 Agent。
 - 支持把触发消息前的最近 `n` 条消息作为上下文传给 GA（`n=0` 关闭）。
-- 支持断线自动重连，支持 token 鉴权。
+- 支持断线自动重连（指数退避）、token 鉴权、Ctrl+C 优雅退出。
 - 支持 Windows / Linux 双平台运行（含 `.venv` 路径自动兼容）。
+- 自带零依赖单元测试（标准库 `unittest`）。
 
 ## 2. 项目结构
 
@@ -25,8 +26,12 @@ onebot_qq/
 │  ├─ onebot_ws.py          # WS URL 规范化、token URL 拼接
 │  ├─ onebot_async.py       # Python 3.8+ 线程兼容工具
 │  ├─ onebot_config.py      # .env 与运行配置加载
-│  ├─ onebot_state.py       # 运行时状态
+│  ├─ onebot_state.py       # 运行时状态、排队消息结构、消息去重
 │  └─ onebot_paths.py       # GenericAgent 路径注入
+├─ tests/                   # 单元测试（标准库 unittest，无额外依赖）
+├─ data/                    # 附件落盘目录（运行时创建，已 gitignore）
+├─ temp/                    # 运行日志（每次启动一个文件，已 gitignore）
+├─ requirements.txt
 ├─ .env.example
 ├─ .env.example-en
 ├─ .env
@@ -127,7 +132,8 @@ python3 src/main.py
 - 私聊机器人一句话，确认有回复。  
 - 群里发一句话，按你的触发策略验证可回复（`@` / 触发词 / 任意消息）。  
 - 发一张图/一段语音/一个文件，确认 `data/image|record|file` 有落盘。  
-- 若失败，先看 `temp/onebot_YYYYMMDD_HHMMSS.log` 是否出现 `retcode=1403` 或连接拒绝（每次启动会生成新的时间戳日志）。  
+- 若失败，先看 `temp/onebot_YYYYMMDD_HHMMSS.log` 是否出现 `retcode=1403` 或连接拒绝（每次启动会生成新的时间戳日志，默认只保留最近 10 个）。  
+- 连不上时日志里的重连间隔会逐步拉长（5s → 10s → … → 60s），这是正常的退避行为。  
 
 ## 6. .env 配置详解
 
@@ -145,8 +151,14 @@ python3 src/main.py
 | `ONEBOT_PLAIN_TEXT_HINT` | 内置提示 | 否 | 附加给 Agent 的文本提示。设为 `0/false/off` 可关闭。 |
 | `ONEBOT_MAX_MSG_LENGTH` | `500` | 否 | 单条消息最大长度。 |
 | `ONEBOT_MAX_QUEUE_SIZE` | `5` | 否 | 每个用户的待处理队列上限。 |
-| `ONEBOT_DATA_DIR` | `data` | 否 | 附件保存目录。相对路径基于**当前运行目录**解析。 |
+| `ONEBOT_DATA_DIR` | `data` | 否 | 附件保存目录。相对路径基于**项目根目录**解析（与启动时的工作目录无关）。 |
 | `ONEBOT_MAX_FILE_BYTES` | `10485760` | 否 | 单附件最大字节数（默认 10MB）。 |
+| `ONEBOT_ATTACHMENT_TTL_HOURS` | `24` | 否 | 附件保留小时数，后台定期清理超期文件。`0`=不清理。 |
+| `ONEBOT_LOCAL_SOURCE_DIRS` | 空 | 否 | 允许作为本地附件来源的目录白名单，逗号分隔。留空=不限制。 |
+| `ONEBOT_SPLIT_LIMIT` | `1500` | 否 | 单条回复的拆分长度上限。拆分不会切断 `[CQ:...]` 段。 |
+| `ONEBOT_LOCK_PORT` | `19529` | 否 | 单实例互斥端口。同机跑第二个实例时需改。 |
+| `ONEBOT_LOG_FILE` | `onebot.log` | 否 | 日志基名，实际文件带启动时间戳，落在 `temp/`。 |
+| `ONEBOT_LOG_KEEP` | `10` | 否 | 保留最近多少个启动日志。`0`=不清理。 |
 
 ### 6.1 常用配置组合（可直接参考）
 
@@ -191,6 +203,31 @@ attachment1: type=image path=D:\...\data\image\xxx.jpg size=123KB
 - 非管理员请求文件级/进程级/硬件级操作时，期望 Agent 拒绝并提示联系管理员。
 - 入口层不做危险关键词硬拦截，避免误伤正常对话。
 
+> 注意：这里的「非管理员禁止」是**写进提示词交给模型自觉遵守**的，不是网关层的硬约束。
+> 详见第 13 节。
+
+### 8.1 聊天命令
+
+直接在私聊或群聊里发送即可（命令由 GenericAgent 的公共前端层处理）。
+
+| 命令 | 权限 | 说明 |
+|---|---|---|
+| `/help` | 所有人 | 显示命令帮助。 |
+| `/status` | 所有人 | 查看 Agent 是否在运行、当前 LLM。 |
+| `/btw <内容>` | 所有人 | 不打断当前任务的旁路提问。 |
+| `/review` | 所有人 | 触发一次 review 任务。 |
+| `/stop` | 仅管理员 | 中止当前任务。 |
+| `/new` | 仅管理员 | 清空会话上下文。 |
+| `/continue` | 仅管理员 | 继续上一轮任务。 |
+| `/restore` | 仅管理员 | 从历史记录恢复上下文。 |
+| `/llm [n]` | 仅管理员 | 列出或切换 LLM 后端。 |
+
+> `ONEBOT_ADMIN_QQ` 留空时**没有任何人**是管理员，上表的管理员命令对所有人都不可用。
+> 需要用这些命令就必须配置至少一个管理员 QQ。
+>
+> `/llm`、`/new`、`/stop`、`/restore` 影响的是**整个进程的共享 Agent**，会作用到所有会话，
+> 因此限定管理员使用。
+
 ## 9. 运行与验证
 
 启动后建议按顺序验证：
@@ -231,7 +268,85 @@ attachment1: type=image path=D:\...\data\image\xxx.jpg size=123KB
 - 优先确认是否在 `GenericAgent` 的虚拟环境中运行。
 - 已兼容 `.venv/Lib/site-packages`（Windows）和 `.venv/lib/python*/site-packages`（Linux）自动注入。
 
+### Q8: 提示端口被占用 / 说已有实例在运行？
+- 单实例互斥默认占用 `19529`。确认没有残留进程，或改 `ONEBOT_LOCK_PORT` 换一个端口。
+
+### Q9: `data/` 里的附件不见了？
+- 默认保留 24 小时，超期会被后台清理。需要长期留存请调大或关闭 `ONEBOT_ATTACHMENT_TTL_HOURS`。
+
+### Q10: 管理员命令（`/stop`、`/new`、`/llm`）说没有权限？
+- 确认 `ONEBOT_ADMIN_QQ` 已配置且包含你的 QQ。留空时没有任何人是管理员。
+
+### Q11: 附件下载总是失败？
+- 只允许 `http(s)` 直链，且不跟随跨协议重定向。
+- 若配了 `ONEBOT_LOCAL_SOURCE_DIRS`，本地来源必须落在白名单目录内。
+- 也检查 `ONEBOT_MAX_FILE_BYTES` 是否小于实际文件。
+
 ## 11. 备注
 
 - 本项目与 GenericAgent 紧耦合，建议固定在 `GenericAgent/temp/onebot_qq` 下运行。
 - 若需二次开发，优先在 `onebot_message.py`（提示词策略）和 `onebot_attachment.py`（附件策略）扩展。
+
+## 12. 运行测试
+
+测试只用标准库，**不需要安装任何额外依赖**：
+
+```bash
+# Windows / Linux 通用
+python -m unittest discover -s tests -t .
+
+# 已安装 pytest 的话也可以
+python -m pytest tests
+```
+
+覆盖范围与是否需要父项目：
+
+| 测试模块 | 被测对象 | 需要 GenericAgent |
+|---|---|---|
+| `test_onebot_ws.py` | WS URL 规范化、token 注入、日志脱敏 | 否 |
+| `test_onebot_message.py` | 出站过滤、CQ 解析与转义、回复拆分、提示词拼装 | 否 |
+| `test_onebot_attachment.py` | 文件名清洗、大小限制、来源白名单、附件清理 | 否 |
+| `test_onebot_config.py` | `.env` 解析、各配置项解析与默认值 | 否 |
+| `test_onebot_state.py` | 消息去重、排队消息结构 | 否 |
+| `test_onebot_app_queue.py` | 每用户队列所有权协议、后台任务生命周期 | 是（缺失时自动跳过） |
+
+## 13. 已知限制与安全须知
+
+上线到公开群聊前请务必了解以下几点。
+
+### 13.1 会话上下文在所有用户之间共享
+
+整个进程只有**一个** GenericAgent 实例，也就只有**一份**对话历史。
+网关做的「按用户排队」只保证同一时刻只有一个任务在跑，**并不隔离上下文**：
+
+- 用户 A 让 Agent 读了某个文件，随后用户 B 在群里问「刚才说了啥」，模型可能把 A 的内容说出来。
+- 管理员的历史轮次仍留在上下文里，非管理员可以借此诱导模型越权。
+
+这是 GenericAgent 公共前端层（`agentmain.py` / `chatapp_common.py`）的设计，不在本项目内，
+本项目无法单独修复。因此：
+
+- **不要**在有陌生人的群里开放本机器人；用 `ONEBOT_ALLOWED_USERS` / `ONEBOT_ALLOWED_GROUPS` 收紧白名单。
+- 默认模板里的 `*`（放行全部）**仅适合本地自测**。
+- 切换话题时用 `/new` 清空上下文。
+
+### 13.2 权限策略靠提示词，不是硬约束
+
+`ONEBOT_ADMIN_QQ` 的作用是往提示词里写一行 `policy: user is NOT admin ...`，
+真正拒绝越权操作的是模型本身。工具层不做鉴权，所以：
+
+- 不要把它当成安全边界，而应视为「降低误操作概率」的措施。
+- 群成员的消息内容、昵称、被 @ 的人、历史消息都会进提示词，存在提示词注入风险。
+- 真正敏感的机器不要以高权限账号运行本程序。
+
+### 13.3 附件来源
+
+- 附件由 OneBot 实现（NapCat）上报，网关会按 `url` / 本地 `path` / `base64` 顺序取用。
+- 下载只允许 `http(s)`，并阻断跨协议重定向；仍建议 NapCat 与本程序同机、监听 `127.0.0.1`。
+- 若 OneBot 端不完全可信，用 `ONEBOT_LOCAL_SOURCE_DIRS` 限定本地来源目录，
+  避免 `data.path` 指向任意本地文件被复制出来并交给 Agent。
+
+### 13.4 磁盘占用
+
+- 附件默认保留 24 小时（`ONEBOT_ATTACHMENT_TTL_HOURS`），启动后由后台任务定期清理。
+- 启动日志默认保留最近 10 个（`ONEBOT_LOG_KEEP`）。
+- 两者设为 `0` 会关闭清理，磁盘将无上限增长。

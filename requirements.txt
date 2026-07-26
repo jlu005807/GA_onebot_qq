@@ -1,1 +1,7 @@
-websockets
+# 运行期唯一的第三方依赖。
+# >=12 覆盖 extra_headers / additional_headers 两种参数名；本项目在 16.0 上验证。
+websockets>=12.0
+
+# 测试不需要额外依赖（标准库 unittest 即可）：
+#   python -m unittest discover -s tests -t .
+# 装了 pytest 也能直接跑：python -m pytest tests
