@@ -8,6 +8,9 @@ OneBotApp 依赖父项目 GenericAgent（chatapp_common / agentmain）。不在�
 """
 
 import asyncio
+import contextlib
+import io
+import os
 import shutil
 import tempfile
 import unittest
@@ -53,6 +56,7 @@ class UserQueueOwnershipTest(unittest.TestCase):
             admin_set=set(),
             plain_text_hint="",
             access_token="",
+            ws_url="ws://127.0.0.1:8080/onebot/v11/ws",
             split_limit=1500,
             local_source_dirs=(),
             attachment_ttl_hours=0,
@@ -144,27 +148,56 @@ class UserQueueOwnershipTest(unittest.TestCase):
             sentinel = object()
             self.state.user_drains["10001"] = sentinel
 
-            self.assertFalse(self.app._release_drain("10001", sentinel))
+            self.assertFalse(self.app._release_drain("10001", sentinel, queue))
             self.assertIs(self.state.user_drains["10001"], sentinel)
             self.assertIn("10001", self.state.user_queues)
 
             queue.get_nowait()
-            self.assertTrue(self.app._release_drain("10001", sentinel))
+            self.assertTrue(self.app._release_drain("10001", sentinel, queue))
             self.assertNotIn("10001", self.state.user_drains)
             self.assertNotIn("10001", self.state.user_queues)
 
         asyncio.run(scenario())
 
-    def test_release_drain_keeps_another_tasks_registration(self):
+    def test_non_owner_cannot_release_anything(self):
+        """回归：非持有者曾能删掉在跑 drain 的队列，留下「有 drain 没队列」的半状态。"""
+
         async def scenario():
-            self.app._get_or_create_queue("10001")
+            queue = self.app._get_or_create_queue("10001")
             owner, other = object(), object()
             self.state.user_drains["10001"] = owner
-            # 非持有者调用时不能把持有者的登记抹掉
-            self.assertTrue(self.app._release_drain("10001", other))
+
+            self.assertFalse(self.app._release_drain("10001", other, queue))
+            self.assertIs(self.state.user_drains["10001"], owner)
+            self.assertIs(self.state.user_queues["10001"], queue)
+
+        asyncio.run(scenario())
+
+    def test_release_refuses_when_queue_is_not_the_registered_one(self):
+        """回归：drain 持有的队列已被换掉时不能再释放，否则会删掉别人的新队列。"""
+
+        async def scenario():
+            stale = asyncio.Queue()
+            fresh = self.app._get_or_create_queue("10001")
+            owner = object()
+            self.state.user_drains["10001"] = owner
+
+            self.assertFalse(self.app._release_drain("10001", owner, stale))
+            self.assertIs(self.state.user_queues["10001"], fresh)
             self.assertIs(self.state.user_drains["10001"], owner)
 
         asyncio.run(scenario())
+
+    def test_drain_exit_leaves_both_dicts_consistent(self):
+        """任何退出路径后都不应留下「有队列没 drain」。"""
+
+        async def scenario():
+            self._enqueue("10001", _make_item("a"))
+            await asyncio.wait_for(self.state.user_drains["10001"], timeout=5)
+
+        asyncio.run(scenario())
+        self.assertNotIn("10001", self.state.user_drains)
+        self.assertNotIn("10001", self.state.user_queues)
 
     def test_separate_users_get_separate_drains(self):
         async def scenario():
@@ -208,6 +241,7 @@ class BackgroundTaskTrackingTest(unittest.TestCase):
             admin_set=set(),
             plain_text_hint="",
             access_token="",
+            ws_url="ws://127.0.0.1:8080/onebot/v11/ws",
             split_limit=1500,
             local_source_dirs=(),
             attachment_ttl_hours=0,
@@ -246,31 +280,86 @@ class BackgroundTaskTrackingTest(unittest.TestCase):
         asyncio.run(scenario())
         self.assertTrue(any("kaboom" in line for line in logs), logs)
 
-    def test_token_is_redacted_from_logs(self):
+    def _emit_and_capture(self, message):
+        """走真正的 _emit_log，而不是替换掉它——要验证的正是「日志出口有没有接上脱敏」。"""
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.app._emit_log(message)
+        return buffer.getvalue()
+
+    def test_real_log_sink_redacts_token(self):
         self.app.config.access_token = "s3cr3t/tok en"
-        logs = []
-        self.app._emit_log = lambda line: logs.append(self.app._redact(line))
+        self.app._secrets = None
+        for line in (
+            "connect failed for ws://h/p?access_token=s3cr3t/tok en",
+            "url encoded: s3cr3t%2Ftok%20en",
+            "form encoded: s3cr3t%2Ftok+en",
+        ):
+            self.assertNotIn("s3cr3t", self._emit_and_capture(line))
 
-        self.app._emit_log("connect failed for ws://h/p?access_token=s3cr3t/tok en")
-        self.app._emit_log("url encoded: s3cr3t%2Ftok%20en")
-        self.app._emit_log("form encoded: s3cr3t%2Ftok+en")
-
-        for line in logs:
-            self.assertNotIn("s3cr3t", line, line)
-
-    def test_redact_is_a_noop_without_token(self):
+    def test_real_log_sink_redacts_token_carried_in_ws_url(self):
+        # 令牌也可以直接写在 ONEBOT_WS_URL 里，此时 access_token 是空的
         self.app.config.access_token = ""
-        self.assertEqual(self.app._redact("plain message"), "plain message")
+        self.app.config.ws_url = "ws://h:1/p?access_token=urltok123"
+        self.app._secrets = None
+        output = self._emit_and_capture("InvalidStatus for ws://h:1/p?access_token=urltok123")
+        self.assertNotIn("urltok123", output)
+        self.assertIn("***", output)
 
-    def test_aclose_cancels_outstanding_tasks(self):
+    def test_real_log_sink_passes_through_without_token(self):
+        self.app.config.access_token = ""
+        self.app.config.ws_url = "ws://h:1/p"
+        self.app._secrets = None
+        self.assertIn("plain message", self._emit_and_capture("plain message"))
+
+    def test_aclose_cancels_tasks_that_outlast_the_grace_period(self):
         async def scenario():
             async def forever():
                 await asyncio.sleep(3600)
 
             task = self.app._spawn(forever())
-            await self.app.aclose()
-            self.assertTrue(task.cancelled() or task.done())
+            # 加超时保护：aclose 若不再取消，这里必须失败而不是把整个套件挂死
+            await asyncio.wait_for(self.app.aclose(grace_seconds=0.05), timeout=5)
+            self.assertTrue(task.cancelled())
             self.assertTrue(self.app._closing)
+
+        asyncio.run(scenario())
+
+    def test_aclose_lets_a_finishing_task_converge(self):
+        """回归：aclose 曾直接取消在途任务，把已经算完的回答打断在发送之前。"""
+        finished = []
+
+        async def scenario():
+            async def short():
+                await asyncio.sleep(0.05)
+                finished.append("done")
+
+            task = self.app._spawn(short())
+            await asyncio.wait_for(self.app.aclose(grace_seconds=5), timeout=10)
+            self.assertFalse(task.cancelled())
+
+        asyncio.run(scenario())
+        self.assertEqual(finished, ["done"])
+
+    def test_aclose_cleans_up_attachments_of_dropped_messages(self):
+        async def scenario():
+            path = os.path.join(self.tmp, "queued.jpg")
+            with open(path, "wb") as handle:
+                handle.write(b"x")
+            item = _make_item("with file")
+            item.attachments = [{"type": "image", "path": path, "size": 1}]
+            self.app._get_or_create_queue("10001").put_nowait(item)
+
+            await asyncio.wait_for(self.app.aclose(grace_seconds=0), timeout=5)
+            self.assertFalse(os.path.exists(path), "停机丢弃的消息附件必须删掉")
+
+        asyncio.run(scenario())
+
+    def test_request_close_is_synchronous_and_idempotent(self):
+        async def scenario():
+            self.app.request_close()
+            self.assertTrue(self.app._closing)
+            self.app.request_close()
 
         asyncio.run(scenario())
 

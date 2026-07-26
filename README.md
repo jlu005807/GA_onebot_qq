@@ -181,7 +181,7 @@ python3 src/main.py
 | `ONEBOT_MAX_FILE_BYTES` | `10485760` | 否 | 单附件最大字节数（默认 10MB）。 |
 | `ONEBOT_ATTACHMENT_TTL_HOURS` | `24` | 否 | 附件保留小时数，后台定期清理超期文件。`0`=不清理。 |
 | `ONEBOT_LOCAL_SOURCE_DIRS` | 空 | 否 | 允许作为本地附件来源的目录白名单，逗号分隔。留空=不限制。 |
-| `ONEBOT_SPLIT_LIMIT` | `1500` | 否 | 单条回复的拆分长度上限。拆分不会切断 `[CQ:...]` 段；单个段本身超长时该分片会略微超出上限。 |
+| `ONEBOT_SPLIT_LIMIT` | `1500` | 否 | 单条回复的拆分长度上限。拆分不会切断 `[CQ:...]` 段，因此分片最多可超出上限 256 字符（`CQ_MAX_INDIVISIBLE`）。 |
 | `ONEBOT_LOCK_PORT` | `19529` | 否 | 单实例互斥端口。同机跑第二个实例时需改。 |
 | `ONEBOT_LOG_FILE` | `onebot.log` | 否 | 日志基名，实际文件带启动时间戳，落在 `temp/`。 |
 | `ONEBOT_LOG_KEEP` | `10` | 否 | 保留最近多少个启动日志。`0`=不清理。 |
@@ -346,7 +346,9 @@ python -m pytest tests
 | `test_onebot_config.py` | `.env` 解析、各配置项解析与默认值 | 否 |
 | `test_onebot_state.py` | 消息去重、排队消息结构 | 否 |
 | `test_docs_alignment.py` | 配置项/命令表/项目结构在代码与文档间是否一致 | 否 |
-| `test_onebot_app_queue.py` | 每用户队列所有权协议、后台任务生命周期 | 是（缺失时自动跳过） |
+| `test_onebot_app_queue.py` | 每用户队列所有权协议、后台任务生命周期、停机收敛 | 是（缺失时自动跳过） |
+| `test_onebot_app_send.py` | 发送路径（拆分/引用/失败即停）与事件分发、命令鉴权 | 是（缺失时自动跳过） |
+| `test_main.py` | 日志命名与保留清理的往返一致性 | 是（缺失时自动跳过） |
 
 `test_docs_alignment.py` 会强制以下几件事保持同步，改了一处忘了另一处就会测试失败：
 
@@ -405,8 +407,11 @@ Agent 的原始输出不是直接发到 QQ 的，`onebot_message.normalize_outgo
 - Markdown 代码块的 ``` 围栏标记（**围栏里的代码本身会保留**）。
 - 连续空行会被压缩成一个。
 
-为避免误伤，未闭合的工具调用块最多只吞掉 40 行（`TOOL_BLOCK_MAX_LINES`）：
-正文里恰好有一行形似工具调用时，超出上限即判定为误判并把内容原样还回去。
+删除工具调用块前会先向后**最多查找 200 行**（`TOOL_BLOCK_MAX_LINES`）寻找结束行：
+
+- 找到结束行 → 整块删除，不限块的长度。
+- 找不到 → 判定为「正文里恰好有一行形似工具调用」，该行按普通正文保留，
+  不会像早期实现那样一路吞到结尾、把整条回复吃光。
 
 同时会给 Agent 注入「只用纯文本、不要 Markdown」的提示词
 （见 `ONEBOT_PLAIN_TEXT_HINT` 与 `build_agent_prompt` 里的 `output_rules`），

@@ -1,5 +1,5 @@
 import re
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 
 STATUS_ONLY_PATTERNS = (
@@ -19,7 +19,11 @@ TOOL_CALL_RE = re.compile(
     r"\s*\(",
 )
 CODE_FENCE_RE = re.compile(r"^```[\w.+-]*\s*$")
-TOOL_BLOCK_MAX_LINES = 40
+# 向后查找工具调用块结束行的最大行数；超出即认为不是工具调用块
+TOOL_BLOCK_MAX_LINES = 200
+# 超过这个长度的 [CQ:...] 匹配不再当作不可分割的整体，
+# 否则正文里出现 "[CQ:" 加一个很远的 "]" 就会撑出一个远超上限的分片
+CQ_MAX_INDIVISIBLE = 256
 CQ_AT_RE = re.compile(r"\[CQ:at,qq=(\d+)\]")
 CQ_SEGMENT_RE = re.compile(r"\[CQ:[^\]]+\]")
 
@@ -62,6 +66,19 @@ def _is_tool_block_end(text: str) -> bool:
     return stripped.endswith((")", "})", "])"))
 
 
+def _find_tool_block_end(lines: Sequence[str], start: int) -> Optional[int]:
+    """在 start 之后的有限窗口里找工具调用块的结束行，找不到返回 None。
+
+    窗口用来限定误判的影响面：真实工具模板远短于这个上限，而正文里偶然形似
+    工具调用的一行通常根本找不到结束行，于是被当作普通正文保留。
+    """
+    limit = min(len(lines), start + 1 + TOOL_BLOCK_MAX_LINES)
+    for index in range(start + 1, limit):
+        if _is_tool_block_end(lines[index].strip()):
+            return index
+    return None
+
+
 def normalize_outgoing_content(content: str) -> str:
     if not content:
         return ""
@@ -69,11 +86,10 @@ def normalize_outgoing_content(content: str) -> str:
     lines = text.split("\n")
 
     filtered: List[str] = []
-    in_tool_block = False
-    # 未闭合的工具调用块最多吞掉这么多行，超出则认为判断有误并把内容还回去，
-    # 避免一句形似工具调用的正文把整条回复全部吃掉。
-    pending: List[str] = []
-    for line in lines:
+    skip_until = -1
+    for index, line in enumerate(lines):
+        if index <= skip_until:
+            continue
         stripped = line.strip()
 
         # Drop assistant status/progress templates wherever they appear.
@@ -82,32 +98,23 @@ def normalize_outgoing_content(content: str) -> str:
 
         # Drop tool-call templates such as:
         # "code_run({...})", "file_read({...})", or lines prefixed with symbols.
-        if not in_tool_block and TOOL_CALL_RE.match(stripped):
+        if TOOL_CALL_RE.match(stripped):
             if _is_tool_block_end(stripped):
                 continue
-            in_tool_block = True
-            pending = [line]
-            continue
-        if in_tool_block:
-            pending.append(line)
-            if _is_tool_block_end(stripped):
-                in_tool_block = False
-                pending = []
-            elif len(pending) > TOOL_BLOCK_MAX_LINES:
-                in_tool_block = False
-                filtered.extend(pending)
-                pending = []
-            continue
+            # 先向后找结束行再决定删不删：
+            # 找到 -> 整块都是工具调用模板，无论多长都删掉；
+            # 找不到 -> 判定为「正文里恰好有一行形似工具调用」，按普通正文处理，
+            #           避免像旧实现那样一路吞到结尾、把整条回复吃光。
+            end = _find_tool_block_end(lines, index)
+            if end is not None:
+                skip_until = end
+                continue
 
         # Remove markdown code-fence markers.
         if CODE_FENCE_RE.match(stripped):
             continue
 
         filtered.append(line)
-
-    # 到结尾仍未闭合：同样按误判处理，保留原文
-    if pending:
-        filtered.extend(pending)
 
     # Collapse excessive blank lines and trim.
     compact: List[str] = []
@@ -255,7 +262,13 @@ def split_for_send(text: str, limit: int) -> List[str]:
     if limit <= 0 or len(body) <= limit:
         return [body]
 
-    spans = [(m.start(), m.end()) for m in CQ_SEGMENT_RE.finditer(body)]
+    # 只把「短到确实像一个 CQ 段」的匹配视为不可分割；CQ_SEGMENT_RE 会把
+    # "[CQ:" 到很远处的 "]" 之间整段吞下，那种匹配不该撑爆分片长度
+    spans = [
+        (m.start(), m.end())
+        for m in CQ_SEGMENT_RE.finditer(body)
+        if m.end() - m.start() <= CQ_MAX_INDIVISIBLE
+    ]
     parts: List[str] = []
     start = 0
     while len(body) - start > limit:

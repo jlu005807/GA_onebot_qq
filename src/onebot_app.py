@@ -6,7 +6,7 @@ import json
 import sys
 import uuid
 from typing import Any, Deque, Dict, List, Optional, Set
-from urllib.parse import quote, quote_plus
+from urllib.parse import parse_qsl, quote, quote_plus, urlsplit
 
 from onebot_paths import setup_sys_path
 
@@ -52,6 +52,8 @@ SEND_GROUP_ACTION = "send_group_msg"
 SEND_PRIVATE_ACTION = "send_private_msg"
 RECONNECT_MIN_SECONDS = 5
 RECONNECT_MAX_SECONDS = 60
+# 停机时留给在途任务自行收敛的时间，超时才强制取消
+SHUTDOWN_GRACE_SECONDS = 20
 
 
 class OneBotApp(AgentChatMixin):
@@ -74,6 +76,7 @@ class OneBotApp(AgentChatMixin):
         # 持有后台任务的强引用：asyncio 只弱引用运行中的任务，丢引用会被 GC 中途回收
         self._bg_tasks: Set["asyncio.Task[Any]"] = set()
         self._closing = False
+        self._secrets: Optional[Set[str]] = None
 
     def _track(self, task: "asyncio.Task[Any]") -> "asyncio.Task[Any]":
         self._bg_tasks.add(task)
@@ -224,14 +227,32 @@ class OneBotApp(AgentChatMixin):
             f"[OneBot->GA] chat={chat_id} group={1 if is_group else 0} sender={sender_qq} prompt={one_line}"
         )
 
+    def _secret_variants(self) -> Set[str]:
+        """需要从日志里抹掉的令牌形式（含缓存）。
+
+        令牌既可以放在 ONEBOT_ACCESS_TOKEN，也可以直接写在 ONEBOT_WS_URL 的
+        query 里（build_ws_connect_url 会保留它）。只盯前者的话，后一种配置下
+        脱敏完全失效，而第三方异常很喜欢把整个 URI 打出来。
+        """
+        if self._secrets is not None:
+            return self._secrets
+        tokens = {(getattr(self.config, "access_token", "") or "").strip()}
+        with contextlib.suppress(Exception):
+            query = parse_qsl(urlsplit(getattr(self.config, "ws_url", "") or "").query)
+            for key, value in query:
+                if key.lower() in {"access_token", "token"} and value.strip():
+                    tokens.add(value.strip())
+        variants = set()
+        for token in tokens:
+            if not token:
+                continue
+            variants.update({token, quote(token, safe=""), quote_plus(token)})
+        self._secrets = variants
+        return variants
+
     def _redact(self, message: str) -> str:
-        # 第三方库抛出的异常常把整个连接 URL 带上，令牌不能就这样落进日志。
-        # URL 里的令牌是转义过的，所以原文和两种转义形式都要替换。
-        token = (getattr(self.config, "access_token", "") or "").strip()
-        if not token:
-            return message
-        for variant in (token, quote(token, safe=""), quote_plus(token)):
-            if variant and variant in message:
+        for variant in self._secret_variants():
+            if variant in message:
                 message = message.replace(variant, "***")
         return message
 
@@ -438,20 +459,35 @@ class OneBotApp(AgentChatMixin):
             item.chat_id, prompt, msg_id=item.message_id, is_group=item.is_group
         )
 
-    def _release_drain(self, user_id: str, task: Any) -> bool:
-        """队列已空时交还所有权，返回是否真的交还了。
+    def _release_drain(self, user_id: str, task: Any, queue: asyncio.Queue) -> bool:
+        """交还队列所有权，返回是否真的交还了。全程无 await，判定与改动一次做完。
 
-        判空与注销必须原子完成，所以两件事都放在这里、且全程没有 await：
-        队列非空却注销掉 drain，积压的消息就没人消费了。
+        三个条件必须同时成立才动手，且两个 dict 必须一起改：
+        只注销 drain 会让积压消息无人消费，只删队列会让 drain 抱着一个
+        已经不在 dict 里的对象继续跑——生产者随后新建的队列同样没人消费。
         """
-        queue = self.state.user_queues.get(user_id)
-        if queue is not None and not queue.empty():
+        if self.state.user_drains.get(user_id) is not task:
             return False
-        if self.state.user_drains.get(user_id) is task:
-            self.state.user_drains.pop(user_id, None)
-        if queue is not None:
-            self.state.user_queues.pop(user_id, None)
+        if self.state.user_queues.get(user_id) is not queue:
+            return False
+        if not queue.empty():
+            return False
+        self.state.user_drains.pop(user_id, None)
+        self.state.user_queues.pop(user_id, None)
         return True
+
+    def _discard_queue(self, user_id: str, queue: asyncio.Queue) -> int:
+        """丢弃队列里剩余的消息，并清掉它们已经落盘的附件。"""
+        dropped = 0
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            dropped += 1
+            cleanup_attachments(getattr(item, "attachments", ()) or ())
+            queue.task_done()
+        return dropped
 
     async def _process_user_queue(self, user_id: str) -> None:
         queue = self.state.user_queues.get(user_id)
@@ -465,7 +501,7 @@ class OneBotApp(AgentChatMixin):
                     item = await asyncio.wait_for(queue.get(), timeout=QUEUE_IDLE_SECONDS)
                 except asyncio.TimeoutError:
                     # 无 await 区段：生产者不可能插进来
-                    if self._release_drain(user_id, current):
+                    if self._release_drain(user_id, current, queue):
                         return
                     continue
 
@@ -480,9 +516,17 @@ class OneBotApp(AgentChatMixin):
                 if QUEUE_ITEM_INTERVAL_SECONDS > 0:
                     await asyncio.sleep(QUEUE_ITEM_INTERVAL_SECONDS)
         finally:
-            # 取消/异常退出时兜底注销，避免把用户永久卡在「已有 drain」状态
+            # 任何退出路径（取消、异常、_closing）都必须让两个 dict 保持一致，
+            # 否则会留下「有队列没 drain」的半状态。
             if self.state.user_drains.get(user_id) is current:
                 self.state.user_drains.pop(user_id, None)
+            if self.state.user_queues.get(user_id) is queue:
+                self.state.user_queues.pop(user_id, None)
+                dropped = self._discard_queue(user_id, queue)
+                if dropped:
+                    self._emit_log(
+                        f"[OneBot] dropped {dropped} queued message(s) for user={user_id}"
+                    )
 
     async def _handle_message_event(self, event: dict) -> None:
         raw_msg = event.get("message", "")
@@ -590,19 +634,51 @@ class OneBotApp(AgentChatMixin):
             segments, is_group=is_group, group_id=group_id, user_id=user_id
         )
         attachments, errors = await self.attachment_manager.download_attachments(segments)
-        if errors:
-            await self.send_text(
-                chat_id,
-                "[OneBot] Attachment save failed: " + "; ".join(errors),
-                msg_id=message_id,
+        # 附件已经落盘，从这里到入队成功之间任何中断都必须把文件删掉，
+        # 否则这条消息永远不会被处理，文件却留在 data/ 里没人回收。
+        try:
+            if errors:
+                await self.send_text(
+                    chat_id,
+                    "[OneBot] Attachment save failed: " + "; ".join(errors),
+                    msg_id=message_id,
+                    is_group=is_group,
+                )
+
+            if not content and not attachments:
+                return
+
+            at_mentions = extract_at_mentions(raw_msg, self.bot_qq)
+            await self._enqueue_message(
+                user_id=user_id,
+                chat_id=chat_id,
+                content=content,
+                attachments=attachments,
+                message_id=message_id,
                 is_group=is_group,
+                is_admin=is_admin,
+                sender_nickname=sender_nickname,
+                at_mentions=at_mentions,
+                history_messages=history_messages,
             )
-
-        if not content and not attachments:
+        except BaseException:
             cleanup_attachments(attachments)
-            return
+            raise
 
-        at_mentions = extract_at_mentions(raw_msg, self.bot_qq)
+    async def _enqueue_message(
+        self,
+        *,
+        user_id: str,
+        chat_id: str,
+        content: str,
+        attachments: List[Dict[str, Any]],
+        message_id: Any,
+        is_group: bool,
+        is_admin: bool,
+        sender_nickname: str,
+        at_mentions: Any,
+        history_messages: Any,
+    ) -> None:
         item = QueuedMessage(
             content=content,
             attachments=attachments,
@@ -736,17 +812,55 @@ class OneBotApp(AgentChatMixin):
                 raise
             backoff = min(backoff * 2, RECONNECT_MAX_SECONDS)
 
-    async def aclose(self) -> None:
-        """停止接收新消息并等待在途后台任务收敛。"""
+    def request_close(self) -> None:
+        """请求停机：停止收新消息并关掉连接，让 connect_and_run 的循环自然退出。
+
+        信号处理里调用，因此只能做同步动作，ws.close() 交给后台任务。
+        """
+        if self._closing:
+            return
+        self._closing = True
+        ws = self.ws
+        if ws is not None:
+            self._spawn(self._close_ws(ws))
+
+    async def _close_ws(self, ws) -> None:
+        with contextlib.suppress(Exception):
+            await ws.close()
+
+    async def aclose(self, grace_seconds: float = SHUTDOWN_GRACE_SECONDS) -> None:
+        """停止接收新消息，先给在途任务一段时间收敛，再取消剩下的。
+
+        直接 cancel 会打断正在 run_agent 里的那一轮——用户的答案已经算完却
+        发不出去，正是「优雅退出」要避免的情况。所以先等，超时才取消。
+        """
         self._closing = True
         ws = self.ws
         if ws is not None:
             with contextlib.suppress(Exception):
                 await ws.close()
+
         pending = [task for task in list(self._bg_tasks) if not task.done()]
-        for task in pending:
+        if pending and grace_seconds > 0:
+            self._emit_log(
+                f"[OneBot] waiting up to {grace_seconds:g}s for {len(pending)} task(s) to finish..."
+            )
+            with contextlib.suppress(Exception):
+                await asyncio.wait(pending, timeout=grace_seconds)
+
+        stubborn = [task for task in pending if not task.done()]
+        for task in stubborn:
             task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        if stubborn:
+            self._emit_log(f"[OneBot] cancelling {len(stubborn)} unfinished task(s)")
+            await asyncio.gather(*stubborn, return_exceptions=True)
+
+        # 队列里还没处理的消息连同已落盘的附件一起丢弃，否则附件永远没人回收
+        # （ONEBOT_ATTACHMENT_TTL_HOURS=0 时更是永久泄漏）
+        dropped = 0
+        for user_id, queue in list(self.state.user_queues.items()):
+            dropped += self._discard_queue(user_id, queue)
+        if dropped:
+            self._emit_log(f"[OneBot] discarded {dropped} pending message(s) on shutdown")
         self.state.user_drains.clear()
         self.state.user_queues.clear()

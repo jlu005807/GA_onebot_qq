@@ -72,6 +72,34 @@ class ToolBlockBoundTest(unittest.TestCase):
         out = normalize_outgoing_content("回答如下\ncode_run(\n还没写完")
         self.assertIn("还没写完", out)
 
+    def test_long_closed_block_is_fully_removed(self):
+        """回归：曾经只要块超过 41 行就被整段原样发出，包括结束行。"""
+        payload = "\n".join(f'  "k{i}": 1,' for i in range(120))
+        text = "开头\nfile_write({\n" + payload + "\n})\n结尾"
+        out = normalize_outgoing_content(text)
+        self.assertEqual(out, "开头\n结尾")
+        self.assertNotIn("file_write", out)
+        self.assertNotIn('"k119"', out)
+
+    def test_block_beyond_the_lookahead_window_is_treated_as_prose(self):
+        # 找不到结束行就按正文处理，而不是无声吞掉
+        from onebot_message import TOOL_BLOCK_MAX_LINES
+
+        filler = "\n".join(f"line{i}" for i in range(TOOL_BLOCK_MAX_LINES + 10))
+        out = normalize_outgoing_content("code_run(\n" + filler + "\n})")
+        self.assertIn("line0", out)
+        self.assertIn(f"line{TOOL_BLOCK_MAX_LINES + 9}", out)
+
+    def test_restored_lines_still_go_through_fence_filtering(self):
+        # 未闭合块被保留时也要走围栏过滤，不能原样吐出 ``` 标记
+        out = normalize_outgoing_content("web_search(\n```json\n内容")
+        self.assertNotIn("```", out)
+        self.assertIn("内容", out)
+
+    def test_consecutive_closed_blocks_are_both_removed(self):
+        text = "a\ncode_run({\nx\n})\nb\nfile_read({\ny\n})\nc"
+        self.assertEqual(normalize_outgoing_content(text), "a\nb\nc")
+
 
 class UnescapeCqTest(unittest.TestCase):
     def test_noop_without_ampersand(self):
@@ -139,6 +167,22 @@ class SplitForSendTest(unittest.TestCase):
 
     def test_limit_zero_returns_single_part(self):
         self.assertEqual(split_for_send("abc", 0), ["abc"])
+
+    def test_prose_with_far_apart_brackets_does_not_blow_up_a_part(self):
+        """回归：CQ_SEGMENT_RE 会把 "[CQ:" 到很远的 "]" 整段匹配，
+        当成不可分割就会撑出远超上限的分片。"""
+        from onebot_message import CQ_MAX_INDIVISIBLE
+
+        body = "看这个 [CQ: " + "长" * 2000 + " ] 结束"
+        limit = 100
+        parts = split_for_send(body, limit)
+        self.assertLessEqual(max(len(p) for p in parts), limit + CQ_MAX_INDIVISIBLE)
+        self.assertGreater(len(parts), 1)
+
+    def test_real_at_segment_is_still_indivisible(self):
+        body = "x" * 95 + "[CQ:at,qq=987654321]" + "y" * 40
+        parts = split_for_send(body, 100)
+        self.assertTrue(any("[CQ:at,qq=987654321]" in p for p in parts))
 
 
 class IsTransientStatusMessageTest(unittest.TestCase):
