@@ -3,6 +3,22 @@
 `onebot_qq` 是一个基于 `OneBot v11` 的 QQ 机器人网关，负责把 NapCat 推送的消息转发给 `GenericAgent`，并把 Agent 回复发送回 QQ。
 本项目的github仓库位于[GA_onebot_qq](https://github.com/jlu005807/GA_onebot_qq.git),对于安装并且已经配置了GenericAgent的用户,可以直接克隆项目到GenericAgent的temp文件夹下，或者让GA仔细阅读[部署教程—SOP](https://fudankw.cn/sophub/sops/69f9806ba1d45b6c2d5f2fd0)进行完成项目克隆，配置并且安装napcat
 
+## 目录
+
+1. [功能概览](#1-功能概览)
+2. [项目结构](#2-项目结构)
+3. [运行前要求](#3-运行前要求)
+4. [快速开始](#4-快速开始)
+5. [NapCat 配置说明（重点）](#5-napcat-配置说明重点)
+6. [.env 配置详解](#6-env-配置详解)
+7. [附件处理规则](#7-附件处理规则)
+8. [权限策略](#8-权限策略) · [聊天命令](#81-聊天命令)
+9. [运行与验证](#9-运行与验证)
+10. [常见问题排查](#10-常见问题排查)
+11. [备注](#11-备注)
+12. [运行测试](#12-运行测试)
+13. [已知限制与安全须知](#13-已知限制与安全须知) ← **上线到公开群聊前请务必读这一节**
+
 ## 1. 功能概览
 
 - 支持私聊与群聊，可配置群聊触发模式（必须 `@` / 任意消息 / 触发词）。
@@ -41,7 +57,7 @@ onebot_qq/
 ## 3. 运行前要求
 
 1. 必须放在 `GenericAgent/temp` 目录下运行（依赖 `agentmain.py` 路径注入）。
-2. Python 3.8+。
+2. 本项目源码兼容 Python 3.8+，但实际以父项目 GenericAgent 的要求为准（`pyproject.toml` 要求 `>=3.10,<3.14`）。
 3. 支持系统：Windows / Linux（代码已兼容两端路径差异）。
 4. 安装依赖：注意可以和GenericAgent使用同一个虚拟环境则不再需要安装额外的依赖即可以跳过下面的一步，但是如果发现运行缺失库需要手动或者让GA进行安装
 
@@ -149,13 +165,13 @@ python3 src/main.py
 | `ONEBOT_CONTEXT_MESSAGES` | `0` | 否 | 向 GA 传递触发前历史消息条数。`0` 关闭，最大 `20`。 |
 | `ONEBOT_ACCESS_TOKEN` | 空 | 按需 | NapCat WS token。设置后会同时用于 Header 与 URL query。 |
 | `ONEBOT_PLAIN_TEXT_HINT` | 内置提示 | 否 | 附加给 Agent 的文本提示。设为 `0/false/off` 可关闭。 |
-| `ONEBOT_MAX_MSG_LENGTH` | `500` | 否 | 单条消息最大长度。 |
-| `ONEBOT_MAX_QUEUE_SIZE` | `5` | 否 | 每个用户的待处理队列上限。 |
+| `ONEBOT_MAX_MSG_LENGTH` | `500` | 否 | **收到的**单条消息文本长度上限，超出会回一条提示并忽略该消息（不限制回复长度，回复长度看 `ONEBOT_SPLIT_LIMIT`）。 |
+| `ONEBOT_MAX_QUEUE_SIZE` | `5` | 否 | 每个用户的待处理队列上限，排满时会回 `Queue is full` 提示。 |
 | `ONEBOT_DATA_DIR` | `data` | 否 | 附件保存目录。相对路径基于**项目根目录**解析（与启动时的工作目录无关）。 |
 | `ONEBOT_MAX_FILE_BYTES` | `10485760` | 否 | 单附件最大字节数（默认 10MB）。 |
 | `ONEBOT_ATTACHMENT_TTL_HOURS` | `24` | 否 | 附件保留小时数，后台定期清理超期文件。`0`=不清理。 |
 | `ONEBOT_LOCAL_SOURCE_DIRS` | 空 | 否 | 允许作为本地附件来源的目录白名单，逗号分隔。留空=不限制。 |
-| `ONEBOT_SPLIT_LIMIT` | `1500` | 否 | 单条回复的拆分长度上限。拆分不会切断 `[CQ:...]` 段。 |
+| `ONEBOT_SPLIT_LIMIT` | `1500` | 否 | 单条回复的拆分长度上限。拆分不会切断 `[CQ:...]` 段；单个段本身超长时该分片会略微超出上限。 |
 | `ONEBOT_LOCK_PORT` | `19529` | 否 | 单实例互斥端口。同机跑第二个实例时需改。 |
 | `ONEBOT_LOG_FILE` | `onebot.log` | 否 | 日志基名，实际文件带启动时间戳，落在 `temp/`。 |
 | `ONEBOT_LOG_KEEP` | `10` | 否 | 保留最近多少个启动日志。`0`=不清理。 |
@@ -185,9 +201,14 @@ python3 src/main.py
   - `data/record`
   - `data/file`
 - 下载源优先级：
-  1. `data.url`（http/https）
-  2. 本地 `data.path` 或本地 `data.file`
+  1. `data.url`（**仅** http/https，且不跟随跨协议重定向）
+  2. 本地 `data.path` 或本地 `data.file`（可用 `ONEBOT_LOCAL_SOURCE_DIRS` 限定目录）
   3. `base64://...` 或 `data:...;base64,...`
+- 群文件/私聊文件若上报里没有可用来源，会先通过 `get_group_file_url` / `get_private_file_url` / `get_file`
+  这几个 OneBot 动作补齐直链，再进入上面的下载流程。
+- 超过 `ONEBOT_MAX_FILE_BYTES` 的文件会被拒绝并回一条 `Attachment save failed`。
+- 落盘文件名会做安全清洗（去掉路径分隔符等），但保留中文等原始文字，并追加一段随机后缀避免重名。
+- 附件默认保留 24 小时后由后台任务清理，见 `ONEBOT_ATTACHMENT_TTL_HOURS`。
 - 成功保存后会把附件信息注入提示词，格式如下：
 
 ```text
@@ -277,7 +298,11 @@ attachment1: type=image path=D:\...\data\image\xxx.jpg size=123KB
 ### Q10: 管理员命令（`/stop`、`/new`、`/llm`）说没有权限？
 - 确认 `ONEBOT_ADMIN_QQ` 已配置且包含你的 QQ。留空时没有任何人是管理员。
 
-### Q11: 附件下载总是失败？
+### Q11: 回复内容像是少了一段？
+- 网关会过滤掉状态行、工具调用模板和代码围栏标记，规则见第 13.4 节。
+- 若确认是正文被误删，把误删的原文贴出来对照 `onebot_message.TOOL_CALL_RE` 排查。
+
+### Q12: 附件下载总是失败？
 - 只允许 `http(s)` 直链，且不跟随跨协议重定向。
 - 若配了 `ONEBOT_LOCAL_SOURCE_DIRS`，本地来源必须落在白名单目录内。
 - 也检查 `ONEBOT_MAX_FILE_BYTES` 是否小于实际文件。
@@ -308,7 +333,15 @@ python -m pytest tests
 | `test_onebot_attachment.py` | 文件名清洗、大小限制、来源白名单、附件清理 | 否 |
 | `test_onebot_config.py` | `.env` 解析、各配置项解析与默认值 | 否 |
 | `test_onebot_state.py` | 消息去重、排队消息结构 | 否 |
+| `test_docs_alignment.py` | 配置项/命令表/项目结构在代码与文档间是否一致 | 否 |
 | `test_onebot_app_queue.py` | 每用户队列所有权协议、后台任务生命周期 | 是（缺失时自动跳过） |
+
+`test_docs_alignment.py` 会强制以下几件事保持同步，改了一处忘了另一处就会测试失败：
+
+- `onebot_config.py` 里读取的每个配置键，都必须出现在 README 配置表和两个 `.env` 模板里（反之亦然）。
+- README 写的默认值必须与代码中的 `DEFAULT_*` 常量一致。
+- README 命令表的权限列必须与 `onebot_app.py` 的 `ADMIN_COMMANDS` 完全对应。
+- `src/` 与 `tests/` 下的每个模块都必须在 README 里被提到。
 
 ## 13. 已知限制与安全须知
 
@@ -345,7 +378,29 @@ python -m pytest tests
 - 若 OneBot 端不完全可信，用 `ONEBOT_LOCAL_SOURCE_DIRS` 限定本地来源目录，
   避免 `data.path` 指向任意本地文件被复制出来并交给 Agent。
 
-### 13.4 磁盘占用
+### 13.4 回复内容会被过滤
+
+Agent 的原始输出不是直接发到 QQ 的，`onebot_message.normalize_outgoing_content`
+会先做一轮清理。了解这点有助于排查「回复内容少了一段」的疑惑：
+
+会被删掉的内容：
+
+- 进度/状态占位行：`思考中...`、`⏳ 还在处理中，请稍等...`、`LLM Running (Turn N)...`。
+- 工具调用模板块：从形如 `工具名(` 的行开始，到出现以 `)`、`})`、`])` 结尾的行为止。
+  识别的工具名为 `code_run`、`file_read`、`file_write`、`file_patch`、`shell_command`、
+  `apply_patch`，`web_` 系列（`scan`/`search`/`open`/`click`/`fetch`/`find`/`query`/`screenshot`），
+  以及 `functions.` / `web.` / `multi_tool_use.` 前缀形式（见 `onebot_message.TOOL_CALL_RE`）。
+- Markdown 代码块的 ``` 围栏标记（**围栏里的代码本身会保留**）。
+- 连续空行会被压缩成一个。
+
+为避免误伤，未闭合的工具调用块最多只吞掉 40 行（`TOOL_BLOCK_MAX_LINES`）：
+正文里恰好有一行形似工具调用时，超出上限即判定为误判并把内容原样还回去。
+
+同时会给 Agent 注入「只用纯文本、不要 Markdown」的提示词
+（见 `ONEBOT_PLAIN_TEXT_HINT` 与 `build_agent_prompt` 里的 `output_rules`），
+因为 QQ 不渲染 Markdown。
+
+### 13.5 磁盘占用
 
 - 附件默认保留 24 小时（`ONEBOT_ATTACHMENT_TTL_HOURS`），启动后由后台任务定期清理。
 - 启动日志默认保留最近 10 个（`ONEBOT_LOG_KEEP`）。
