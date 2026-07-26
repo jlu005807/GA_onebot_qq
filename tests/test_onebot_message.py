@@ -1,6 +1,9 @@
 import unittest
 
 from onebot_message import (
+    escape_cq,
+    split_for_send,
+    unescape_cq,
     build_agent_prompt,
     extract_at_mentions,
     extract_segments,
@@ -51,6 +54,91 @@ class NormalizeOutgoingContentTest(unittest.TestCase):
     def test_plain_text_preserved(self):
         text = "你好，这是一段正常回复。\n第二行内容。"
         self.assertEqual(normalize_outgoing_content(text), text)
+
+
+class ToolBlockBoundTest(unittest.TestCase):
+    def test_unclosed_tool_block_does_not_eat_the_whole_reply(self):
+        # 正文里出现形似工具调用的一行，不能把后面所有内容都吞掉
+        text = "web_search(\n" + "\n".join(f"正文第{i}行" for i in range(1, 60))
+        out = normalize_outgoing_content(text)
+        self.assertIn("正文第1行", out)
+        self.assertIn("正文第59行", out)
+
+    def test_closed_tool_block_is_still_removed(self):
+        text = "开头\nshell_command({\n  'cmd': 'ls'\n})\n结尾"
+        self.assertEqual(normalize_outgoing_content(text), "开头\n结尾")
+
+    def test_short_unclosed_block_at_eof_is_restored(self):
+        out = normalize_outgoing_content("回答如下\ncode_run(\n还没写完")
+        self.assertIn("还没写完", out)
+
+
+class UnescapeCqTest(unittest.TestCase):
+    def test_noop_without_ampersand(self):
+        self.assertEqual(unescape_cq("plain"), "plain")
+        self.assertEqual(unescape_cq(""), "")
+        self.assertEqual(unescape_cq(None), "")
+
+    def test_brackets_and_amp(self):
+        self.assertEqual(unescape_cq("&#91;a&#93; &amp; b"), "[a] & b")
+
+    def test_comma_only_inside_segment(self):
+        self.assertEqual(unescape_cq("a&#44;b"), "a&#44;b")
+        self.assertEqual(unescape_cq("a&#44;b", in_segment=True), "a,b")
+
+    def test_round_trip(self):
+        for raw in ("a&b", "[x]", "a,b", "&#91;literal&#93;", "混合 & [值] , 逗号"):
+            self.assertEqual(unescape_cq(escape_cq(raw)), raw)
+            self.assertEqual(
+                unescape_cq(escape_cq(raw, in_segment=True), in_segment=True), raw
+            )
+
+
+class CqSegmentUnescapeTest(unittest.TestCase):
+    def test_url_with_escaped_ampersand_is_restored(self):
+        # 不还原就会拿到坏 URL，附件下载直接失败
+        segs = extract_segments("[CQ:image,file=a.jpg,url=http://h/a?x=1&amp;y=2]")
+        self.assertEqual(segs[0]["data"]["url"], "http://h/a?x=1&y=2")
+
+    def test_escaped_comma_in_value(self):
+        segs = extract_segments("[CQ:file,name=a&#44;b.txt]")
+        self.assertEqual(segs[0]["data"]["name"], "a,b.txt")
+
+
+class SplitForSendTest(unittest.TestCase):
+    def test_short_text_stays_whole(self):
+        self.assertEqual(split_for_send("hello", 100), ["hello"])
+
+    def test_blank_becomes_placeholder(self):
+        self.assertEqual(split_for_send("", 100), ["..."])
+        self.assertEqual(split_for_send("   ", 100), ["..."])
+
+    def test_all_content_is_preserved(self):
+        body = "".join(str(i % 10) for i in range(250))
+        parts = split_for_send(body, 100)
+        self.assertGreater(len(parts), 1)
+        self.assertEqual("".join(parts), body)
+
+    def test_prefers_newline_boundary(self):
+        body = "a" * 70 + "\n" + "b" * 70
+        parts = split_for_send(body, 100)
+        self.assertEqual(parts[0], "a" * 70)
+
+    def test_never_cuts_inside_a_cq_segment(self):
+        body = "x" * 95 + "[CQ:at,qq=123456]" + "y" * 50
+        parts = split_for_send(body, 100)
+        # 每个分片里的 [CQ: 都必须成对闭合，否则 @ 会变成一串乱码文本
+        for part in parts:
+            self.assertEqual(part.count("[CQ:"), part.count("]"), part)
+        self.assertTrue(any("[CQ:at,qq=123456]" in part for part in parts))
+
+    def test_oversize_single_segment_is_kept_intact(self):
+        body = "x" * 50 + "[CQ:at,qq=" + "9" * 200 + "]"
+        parts = split_for_send(body, 60)
+        self.assertTrue(any("[CQ:at,qq=" + "9" * 200 + "]" in part for part in parts))
+
+    def test_limit_zero_returns_single_part(self):
+        self.assertEqual(split_for_send("abc", 0), ["abc"])
 
 
 class IsTransientStatusMessageTest(unittest.TestCase):
@@ -131,6 +219,22 @@ class ExtractTextTest(unittest.TestCase):
 
     def test_non_string_non_list(self):
         self.assertEqual(extract_text(42), "42")
+
+    def test_string_form_unescapes_cq_entities(self):
+        self.assertEqual(extract_text("a &amp; b &#91;x&#93;"), "a & b [x]")
+
+    def test_amp_is_unescaped_last(self):
+        # &amp;#91; 必须还原成字面量 "&#91;"，不能被二次解码成 "["
+        self.assertEqual(extract_text("&amp;#91;"), "&#91;")
+
+    def test_list_form_keeps_literal_cq_text(self):
+        # 数组格式的 text 段未转义，用户原样输入的 CQ 文本不能被剥掉
+        msg = [{"type": "text", "data": {"text": "看这个 [CQ:at,qq=1] 写法"}}]
+        self.assertEqual(extract_text(msg), "看这个 [CQ:at,qq=1] 写法")
+
+    def test_list_form_does_not_unescape(self):
+        msg = [{"type": "text", "data": {"text": "a &amp; b"}}]
+        self.assertEqual(extract_text(msg), "a &amp; b")
 
 
 class MatchTriggerWordTest(unittest.TestCase):

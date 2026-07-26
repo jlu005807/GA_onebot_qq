@@ -14,6 +14,32 @@ from onebot_config import load_config
 from onebot_state import OneBotState
 
 
+def _prune_old_logs(keep: int) -> None:
+    """只保留最近 keep 个启动日志；每次启动都新建文件，不清理会一直堆积。"""
+    if keep <= 0:
+        return
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp")
+    try:
+        entries = [
+            entry
+            for entry in os.scandir(log_dir)
+            if entry.is_file()
+            and entry.name.startswith("onebot_")
+            and entry.name.endswith(".log")
+        ]
+    except OSError:
+        return
+    try:
+        entries.sort(key=lambda entry: entry.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for entry in entries[keep:]:
+        try:
+            os.remove(entry.path)
+        except OSError:
+            pass
+
+
 def _build_timestamped_log_name(log_name: str) -> str:
     base = os.path.basename((log_name or "onebot.log").strip()) or "onebot.log"
     stem, ext = os.path.splitext(base)
@@ -46,6 +72,7 @@ def run() -> None:
 
     _lock_sock = ensure_single_instance(config.lock_port, "OneBot")
     require_runtime(agent, "OneBot")
+    _prune_old_logs(config.log_keep)
     run_log_file = _build_timestamped_log_name(config.log_file)
     redirect_log(__file__, run_log_file, "OneBot", config.allowed_users)
 

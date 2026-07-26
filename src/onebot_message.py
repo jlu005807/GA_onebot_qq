@@ -19,8 +19,33 @@ TOOL_CALL_RE = re.compile(
     r"\s*\(",
 )
 CODE_FENCE_RE = re.compile(r"^```[\w.+-]*\s*$")
+TOOL_BLOCK_MAX_LINES = 40
 CQ_AT_RE = re.compile(r"\[CQ:at,qq=(\d+)\]")
 CQ_SEGMENT_RE = re.compile(r"\[CQ:[^\]]+\]")
+
+
+def unescape_cq(text: str, *, in_segment: bool = False) -> str:
+    """还原 OneBot v11 的 CQ 转义。
+
+    纯文本中 ``&`` ``[`` ``]`` 会被转义；CQ 段的参数值里 ``,`` 也会被转义。
+    必须最后再还原 ``&amp;``，否则 ``&amp;#91;`` 会被二次解码成 ``[``。
+    """
+    if not text or "&" not in text:
+        return text or ""
+    result = text.replace("&#91;", "[").replace("&#93;", "]")
+    if in_segment:
+        result = result.replace("&#44;", ",")
+    return result.replace("&amp;", "&")
+
+
+def escape_cq(text: str, *, in_segment: bool = False) -> str:
+    """按 OneBot v11 规则转义，供构造 CQ 字符串时使用（``&`` 必须最先处理）。"""
+    if not text:
+        return ""
+    result = text.replace("&", "&amp;").replace("[", "&#91;").replace("]", "&#93;")
+    if in_segment:
+        result = result.replace(",", "&#44;")
+    return result
 
 
 def _is_status_line(text: str) -> bool:
@@ -45,6 +70,9 @@ def normalize_outgoing_content(content: str) -> str:
 
     filtered: List[str] = []
     in_tool_block = False
+    # 未闭合的工具调用块最多吞掉这么多行，超出则认为判断有误并把内容还回去，
+    # 避免一句形似工具调用的正文把整条回复全部吃掉。
+    pending: List[str] = []
     for line in lines:
         stripped = line.strip()
 
@@ -55,13 +83,20 @@ def normalize_outgoing_content(content: str) -> str:
         # Drop tool-call templates such as:
         # "code_run({...})", "file_read({...})", or lines prefixed with symbols.
         if not in_tool_block and TOOL_CALL_RE.match(stripped):
-            in_tool_block = True
             if _is_tool_block_end(stripped):
-                in_tool_block = False
+                continue
+            in_tool_block = True
+            pending = [line]
             continue
         if in_tool_block:
+            pending.append(line)
             if _is_tool_block_end(stripped):
                 in_tool_block = False
+                pending = []
+            elif len(pending) > TOOL_BLOCK_MAX_LINES:
+                in_tool_block = False
+                filtered.extend(pending)
+                pending = []
             continue
 
         # Remove markdown code-fence markers.
@@ -69,6 +104,10 @@ def normalize_outgoing_content(content: str) -> str:
             continue
 
         filtered.append(line)
+
+    # 到结尾仍未闭合：同样按误判处理，保留原文
+    if pending:
+        filtered.extend(pending)
 
     # Collapse excessive blank lines and trim.
     compact: List[str] = []
@@ -107,34 +146,49 @@ def parse_send_content(text: str) -> List[Dict[str, Any]]:
     return segments
 
 
+def _at_targets(raw_msg: Any) -> List[str]:
+    """统一取出消息里所有 @ 目标，字符串/数组两种上报格式走同一套解析。"""
+    targets: List[str] = []
+    for seg in extract_segments(raw_msg):
+        if seg.get("type") != "at":
+            continue
+        data = seg.get("data")
+        if not isinstance(data, dict):
+            continue
+        qq = str(data.get("qq", "")).strip()
+        if qq:
+            targets.append(qq)
+    return targets
+
+
 def is_at_bot(raw_msg: Any, bot_qq: str) -> bool:
-    if isinstance(raw_msg, str):
-        return f"[CQ:at,qq={bot_qq}]" in raw_msg
-    if isinstance(raw_msg, list):
-        for seg in raw_msg:
-            if isinstance(seg, dict) and seg.get("type") == "at":
-                if str(seg.get("data", {}).get("qq", "")) == bot_qq:
-                    return True
-    return False
+    # 不能用 f"[CQ:at,qq={bot_qq}]" 做子串匹配：部分实现会带上 name 等附加参数
+    bot = str(bot_qq or "").strip()
+    if not bot:
+        return False
+    return bot in _at_targets(raw_msg)
 
 
 def extract_text(raw_msg: Any) -> str:
     if isinstance(raw_msg, str):
+        # 字符串上报格式里 CQ 段与转义实体共存：先去段，再还原 &amp; / &#91; / &#93;
         content = raw_msg
-    elif isinstance(raw_msg, list):
+        if "[CQ:" in content:
+            content = CQ_SEGMENT_RE.sub("", content)
+        return unescape_cq(content).strip()
+
+    if isinstance(raw_msg, list):
+        # 数组上报格式的 text 段本身未转义，不能再按 CQ 规则剥离，
+        # 否则用户原样输入的 "[CQ:at,qq=1]" 这类文本会被误删。
         parts: List[str] = []
         for seg in raw_msg:
             if isinstance(seg, dict) and seg.get("type") == "text":
                 parts.append(str(seg.get("data", {}).get("text", "")))
             elif isinstance(seg, str):
                 parts.append(seg)
-        content = "".join(parts)
-    else:
-        content = str(raw_msg)
+        return "".join(parts).strip()
 
-    if "[CQ:" in content:
-        content = CQ_SEGMENT_RE.sub("", content)
-    return content.strip()
+    return str(raw_msg).strip()
 
 
 def match_trigger_word(content: str, trigger_words: Sequence[str]) -> str:
@@ -152,18 +206,8 @@ def match_trigger_word(content: str, trigger_words: Sequence[str]) -> str:
 
 
 def extract_at_mentions(raw_msg: Any, bot_qq: str) -> List[str]:
-    mentions: List[str] = []
-    if isinstance(raw_msg, list):
-        for seg in raw_msg:
-            if isinstance(seg, dict) and seg.get("type") == "at":
-                qq = str(seg.get("data", {}).get("qq", ""))
-                if qq and qq != bot_qq and qq != "all":
-                    mentions.append(qq)
-    elif isinstance(raw_msg, str):
-        for match in CQ_AT_RE.finditer(raw_msg):
-            qq = match.group(1)
-            if qq != bot_qq:
-                mentions.append(qq)
+    bot = str(bot_qq or "").strip()
+    mentions = [qq for qq in _at_targets(raw_msg) if qq != bot and qq != "all"]
     # de-dup while keeping order
     return list(dict.fromkeys(mentions))
 
@@ -197,14 +241,54 @@ def _parse_cq_segment(code: str) -> Dict[str, Any]:
     for part in parts[1:]:
         if "=" in part:
             key, value = part.split("=", 1)
-            data[key.strip()] = value.strip()
+            # 参数值里的 , & [ ] 都是转义过的，不还原会拿到坏 URL（?a=1&amp;b=2）
+            data[key.strip()] = unescape_cq(value.strip(), in_segment=True)
     return {"type": seg_type, "data": data}
+
+
+def split_for_send(text: str, limit: int) -> List[str]:
+    """按长度切分待发送文本，但绝不在 ``[CQ:...]`` 段内部切开。
+
+    在 CQ 段中间截断会把 @ 变成一串乱码文本，因此宁可让某一块略微超长。
+    """
+    body = (text or "").strip() or "..."
+    if limit <= 0 or len(body) <= limit:
+        return [body]
+
+    spans = [(m.start(), m.end()) for m in CQ_SEGMENT_RE.finditer(body)]
+    parts: List[str] = []
+    start = 0
+    while len(body) - start > limit:
+        hard = start + limit
+        cut = body.rfind("\n", start, hard)
+        if cut - start < limit * 0.6:
+            cut = hard
+        for begin, end in spans:
+            if begin < cut < end:
+                # 段落起点还在本块之后就整段顺延，否则该段本身超长，整段留在本块
+                cut = begin if begin > start else end
+                break
+        chunk = body[start:cut].rstrip()
+        if chunk:
+            parts.append(chunk)
+        start = cut
+        while start < len(body) and body[start] in " \t\r\n":
+            start += 1
+
+    tail = body[start:]
+    if tail:
+        parts.append(tail)
+    return parts or ["..."]
 
 
 def format_attachments(attachments: Sequence[Dict[str, Any]]) -> str:
     lines: List[str] = []
     for idx, item in enumerate(attachments, start=1):
-        size_kb = max(1, int(item.get("size", 0)) // 1024)
+        try:
+            size_bytes = int(item.get("size", 0))
+        except (TypeError, ValueError):
+            size_bytes = 0
+        size_kb = max(1, size_bytes // 1024)
         lines.append(
             f"attachment{idx}: type={item.get('type')} path={item.get('path')} size={size_kb}KB"
         )

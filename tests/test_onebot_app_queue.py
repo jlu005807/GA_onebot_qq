@@ -52,6 +52,10 @@ class UserQueueOwnershipTest(unittest.TestCase):
             context_messages=0,
             admin_set=set(),
             plain_text_hint="",
+            access_token="",
+            split_limit=1500,
+            local_source_dirs=(),
+            attachment_ttl_hours=0,
         )
         self.state = OneBotState(agent=None, user_tasks={})
         self.app = OneBotApp(self.state, config)
@@ -172,6 +176,10 @@ class BackgroundTaskTrackingTest(unittest.TestCase):
             context_messages=0,
             admin_set=set(),
             plain_text_hint="",
+            access_token="",
+            split_limit=1500,
+            local_source_dirs=(),
+            attachment_ttl_hours=0,
         )
         self.app = OneBotApp(OneBotState(agent=None, user_tasks={}), config)
 

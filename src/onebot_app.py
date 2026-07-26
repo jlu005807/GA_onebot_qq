@@ -11,7 +11,8 @@ from onebot_paths import setup_sys_path
 
 setup_sys_path()
 
-from chatapp_common import AgentChatMixin, public_access, split_text
+from chatapp_common import AgentChatMixin, public_access
+from onebot_async import run_in_thread
 from onebot_attachment import OneBotAttachmentManager, cleanup_attachments
 from onebot_config import OneBotConfig
 from onebot_message import (
@@ -24,6 +25,7 @@ from onebot_message import (
     match_trigger_word,
     normalize_outgoing_content,
     parse_send_content,
+    split_for_send,
 )
 from onebot_state import OneBotState, QueuedMessage
 from onebot_ws import build_ws_connect_url, mask_ws_url
@@ -42,7 +44,9 @@ HISTORY_MAXLEN = 40
 HISTORY_TEXT_MAXLEN = 300
 # 最多为多少个会话保留上下文历史，防止长期运行时无界增长
 HISTORY_MAX_CHATS = 500
-ADMIN_COMMANDS = {"/stop", "/new", "/restore", "/continue"}
+# 会影响全局 Agent 状态的命令仅管理员可用。/llm 会切换整个进程的 LLM 后端，
+# 因此必须与 /stop、/new 同等对待。
+ADMIN_COMMANDS = {"/stop", "/new", "/restore", "/continue", "/llm"}
 SEND_GROUP_ACTION = "send_group_msg"
 SEND_PRIVATE_ACTION = "send_private_msg"
 RECONNECT_MIN_SECONDS = 5
@@ -56,11 +60,13 @@ class OneBotApp(AgentChatMixin):
         super().__init__(state.agent, state.user_tasks)
         self.state = state
         self.config = config
+        self.split_limit = getattr(config, "split_limit", None) or type(self).split_limit
         self.ws = None
         self.bot_qq = ""
         self.attachment_manager = OneBotAttachmentManager(
             data_dir=self.config.data_dir,
             max_file_bytes=self.config.max_file_bytes,
+            local_source_dirs=getattr(self.config, "local_source_dirs", ()),
         )
         self._pending_calls: Dict[str, asyncio.Future] = {}
         self._chat_histories: "OrderedDict[str, Deque[str]]" = OrderedDict()
@@ -122,10 +128,11 @@ class OneBotApp(AgentChatMixin):
             return
         action = SEND_GROUP_ACTION if is_group else SEND_PRIVATE_ACTION
 
-        for part in split_text(content, self.split_limit):
+        for index, part in enumerate(split_for_send(content, self.split_limit)):
             params = {"group_id": target} if is_group else {"user_id": target}
             msg_segments = []
-            if msg_id:
+            # 引用只加在第一条，长回复拆分后每条都引用会刷屏
+            if msg_id and index == 0:
                 msg_segments.append({"type": "reply", "data": {"id": str(msg_id)}})
             part_segments = parse_send_content(part)
             if part_segments:
@@ -216,7 +223,15 @@ class OneBotApp(AgentChatMixin):
             f"[OneBot->GA] chat={chat_id} group={1 if is_group else 0} sender={sender_qq} prompt={one_line}"
         )
 
+    def _redact(self, message: str) -> str:
+        # 第三方库抛出的异常常把整个连接 URL 带上，令牌不能就这样落进日志
+        token = (self.config.access_token or "").strip()
+        if token and token in message:
+            return message.replace(token, "***")
+        return message
+
     def _emit_log(self, message: str) -> None:
+        message = self._redact(str(message))
         print(message)
         real_stdout = getattr(sys, "__stdout__", None)
         if real_stdout and real_stdout is not sys.stdout:
@@ -466,8 +481,11 @@ class OneBotApp(AgentChatMixin):
 
         msg_type = event.get("message_type")
         is_group = msg_type == "group"
-        sender = event.get("sender", {})
-        sender_nickname = sender.get("nickname", "") or sender.get("card", "") or ""
+        # 上报里 sender 可能显式为 null，event.get("sender", {}) 会拿到 None
+        sender = event.get("sender") or {}
+        if not isinstance(sender, dict):
+            sender = {}
+        sender_nickname = str(sender.get("nickname") or sender.get("card") or "")
 
         raw_user_id = sender.get("user_id") or event.get("user_id")
         user_id = str(raw_user_id).strip() if raw_user_id is not None else ""
@@ -605,7 +623,30 @@ class OneBotApp(AgentChatMixin):
             return
         await self._handle_message_event(event)
 
+    async def _attachment_reaper(self) -> None:
+        """按保留期清理落盘附件，防止 data/ 无界增长。"""
+        ttl_hours = getattr(self.config, "attachment_ttl_hours", 0) or 0
+        if ttl_hours <= 0:
+            return
+        ttl_seconds = ttl_hours * 3600
+        interval = min(3600, max(300, ttl_seconds // 4))
+        while not self._closing:
+            try:
+                removed = await run_in_thread(self.attachment_manager.prune, ttl_seconds)
+            except Exception as exc:
+                self._emit_log(f"[OneBot] attachment prune failed: {exc}")
+            else:
+                if removed:
+                    self._emit_log(
+                        f"[OneBot] pruned {removed} attachment(s) older than {ttl_hours}h"
+                    )
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+
     async def connect_and_run(self):
+        self._spawn(self._attachment_reaper())
         connect_url = build_ws_connect_url(self.config.ws_url, self.config.access_token)
         display_url = mask_ws_url(connect_url)
 

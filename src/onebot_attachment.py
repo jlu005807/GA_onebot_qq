@@ -2,6 +2,7 @@ import base64
 import os
 import re
 import shutil
+import time
 import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -15,12 +16,41 @@ DEFAULT_EXTENSIONS = {
     "record": ".silk",
     "file": ".bin",
 }
+# 只保留文件名里安全的字符：允许中日韩等 Unicode 文字，剔除路径分隔符与控制字符
+UNSAFE_NAME_RE = re.compile(r"[^\w.\-]+", re.UNICODE)
+MAX_NAME_BASE_LEN = 64
+MAX_NAME_EXT_LEN = 16
+ALLOWED_URL_SCHEMES = {"http", "https"}
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """只允许 http/https 之间跳转，阻断被重定向到 ftp:// 等其它协议。"""
+
+    max_redirections = 5
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urlparse(newurl).scheme.lower() not in ALLOWED_URL_SCHEMES:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_URL_OPENER = urllib.request.build_opener(_SafeRedirectHandler)
 
 
 class OneBotAttachmentManager:
-    def __init__(self, data_dir: str, max_file_bytes: int):
+    def __init__(
+        self,
+        data_dir: str,
+        max_file_bytes: int,
+        local_source_dirs: Sequence[str] = (),
+    ):
         self.data_dir = os.path.abspath(data_dir)
         self.max_file_bytes = max_file_bytes
+        # 非空时，只接受这些目录下的本地文件来源（纵深防御：OneBot 端被控时
+        # data.path 可指向任意本地文件，内容会被复制并把路径交给 Agent）
+        self.local_source_dirs = tuple(
+            os.path.abspath(item) for item in local_source_dirs if str(item).strip()
+        )
         self.data_dirs = {
             "image": os.path.join(self.data_dir, "image"),
             "record": os.path.join(self.data_dir, "record"),
@@ -29,20 +59,28 @@ class OneBotAttachmentManager:
         for path in self.data_dirs.values():
             os.makedirs(path, exist_ok=True)
 
+    @staticmethod
+    def _sanitize_component(value: str, max_len: int) -> str:
+        # 先取 basename 并把两种分隔符都切掉：Linux 上 os.path.basename 不认 "\"
+        cleaned = str(value or "").replace("\\", "/").rsplit("/", 1)[-1]
+        cleaned = UNSAFE_NAME_RE.sub("_", cleaned).strip("._ ")
+        return cleaned[:max_len]
+
     def _build_filename(self, name_hint: str, source: str, default_ext: str) -> str:
         base = ""
         ext = ""
         if name_hint:
-            base, ext = os.path.splitext(os.path.basename(name_hint))
+            base, ext = os.path.splitext(os.path.basename(str(name_hint).replace("\\", "/")))
         if not ext and source:
             ext = os.path.splitext(urlparse(source).path)[1]
         if not ext:
             ext = default_ext
-        if not base:
-            base = "file"
-        base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._")
-        if not base:
-            base = "file"
+
+        base = self._sanitize_component(base, MAX_NAME_BASE_LEN) or "file"
+        # 扩展名同样必须清洗：它此前直接来自消息字段，从未被过滤
+        ext_body = self._sanitize_component(ext, MAX_NAME_EXT_LEN)
+        ext = f".{ext_body}" if ext_body else (default_ext or ".bin")
+
         suffix = uuid.uuid4().hex[:8]
         return f"{base}_{suffix}{ext}"
 
@@ -58,13 +96,30 @@ class OneBotAttachmentManager:
             return file_ref
         return ""
 
+    def _is_allowed_local_source(self, path: str) -> bool:
+        if not self.local_source_dirs:
+            return True
+        try:
+            resolved = os.path.realpath(path)
+        except OSError:
+            return False
+        for root in self.local_source_dirs:
+            try:
+                if os.path.commonpath([resolved, os.path.realpath(root)]) == os.path.realpath(root):
+                    return True
+            except ValueError:
+                # 不同盘符无公共前缀
+                continue
+        return False
+
     def _get_local_source(self, data: Dict[str, Any]) -> str:
-        path = self._normalize_local_path(str(data.get("path", "")).strip())
-        if path and os.path.isfile(path):
-            return path
-        file_ref = self._normalize_local_path(str(data.get("file", "")).strip())
-        if file_ref and os.path.isfile(file_ref):
-            return file_ref
+        for key in ("path", "file"):
+            candidate = self._normalize_local_path(str(data.get(key, "")).strip())
+            if not candidate or not os.path.isfile(candidate):
+                continue
+            if not self._is_allowed_local_source(candidate):
+                continue
+            return candidate
         return ""
 
     def _normalize_local_path(self, value: str) -> str:
@@ -93,9 +148,11 @@ class OneBotAttachmentManager:
         return ""
 
     def _download_file_sync(self, url: str, dest_path: str) -> int:
+        if urlparse(url).scheme.lower() not in ALLOWED_URL_SCHEMES:
+            return 0
         req = urllib.request.Request(url, headers={"User-Agent": "OneBot"})
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with _URL_OPENER.open(req, timeout=20) as resp:
                 length = resp.headers.get("Content-Length")
                 if length:
                     try:
@@ -139,6 +196,9 @@ class OneBotAttachmentManager:
             return 0
 
     def _save_base64_sync(self, payload: str, dest_path: str) -> int:
+        # 先按编码长度粗筛，避免为了判大小把一个超大 payload 整块解码进内存
+        if len(payload) > (self.max_file_bytes // 3 + 1) * 4 + 16:
+            return 0
         try:
             binary = base64.b64decode(payload, validate=False)
         except Exception:
@@ -228,6 +288,31 @@ class OneBotAttachmentManager:
 
             errors.append(f"{seg_type} has no usable source (url/path/base64)")
         return attachments, errors
+
+    def prune(self, ttl_seconds: int) -> int:
+        """删除超过保留期的落盘附件，返回删除数量。ttl<=0 表示不清理。
+
+        附件在正常处理完后没有任何删除时机，长期运行会把磁盘写满，
+        因此按时间保留而不是处理完立刻删——Agent 可能还要追问同一张图。
+        """
+        if ttl_seconds <= 0:
+            return 0
+        cutoff = time.time() - ttl_seconds
+        removed = 0
+        for directory in self.data_dirs.values():
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if not entry.is_file() or entry.stat().st_mtime >= cutoff:
+                        continue
+                    os.remove(entry.path)
+                    removed += 1
+                except OSError:
+                    continue
+        return removed
 
 
 def cleanup_attachments(attachments: Sequence[Dict[str, Any]]) -> None:

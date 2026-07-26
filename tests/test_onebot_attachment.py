@@ -3,6 +3,7 @@ import base64
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
 from onebot_attachment import OneBotAttachmentManager, cleanup_attachments
@@ -62,6 +63,28 @@ class BuildFilenameTest(AttachmentManagerTestCase):
         name = self.manager._build_filename("...", "", ".jpg")
         self.assertTrue(name.endswith(".jpg"))
         self.assertNotIn("..", name)
+
+    def test_unicode_filename_is_kept_readable(self):
+        # 中文名此前会被整体替换成 "_"，Agent 看不出附件是什么
+        name = self.manager._build_filename("季度报告.pdf", "", ".bin")
+        self.assertIn("季度报告", name)
+        self.assertTrue(name.endswith(".pdf"))
+
+    def test_extension_is_sanitized(self):
+        # 扩展名此前直接来自消息字段，未经任何过滤
+        name = self.manager._build_filename("a.j/p\\g", "", ".bin")
+        self.assertNotIn("/", name)
+        self.assertNotIn("\\", name)
+
+    def test_backslash_separator_stripped_on_every_platform(self):
+        name = self.manager._build_filename(r"..\..\windows\evil.exe", "", ".bin")
+        self.assertNotIn("\\", name)
+        self.assertNotIn("..", name)
+        self.assertTrue(name.startswith("evil_"))
+
+    def test_absurdly_long_name_is_capped(self):
+        name = self.manager._build_filename("a" * 500 + "." + "b" * 100, "", ".bin")
+        self.assertLess(len(name), 130)
 
 
 class NormalizeLocalPathTest(AttachmentManagerTestCase):
@@ -206,6 +229,95 @@ class DownloadAttachmentsTest(AttachmentManagerTestCase):
         attachments, errors = self._run([{"type": "file", "data": {"path": src}}])
         self.assertEqual(attachments, [])
         self.assertEqual(len(errors), 1)
+
+
+class LocalSourceAllowlistTest(AttachmentManagerTestCase):
+    def test_any_path_allowed_when_allowlist_empty(self):
+        path = self._write("free.txt")
+        self.assertEqual(self.manager._get_local_source({"path": path}), os.path.normpath(path))
+
+    def test_outside_allowlist_is_rejected(self):
+        allowed_dir = os.path.join(self.tmp, "allowed")
+        os.makedirs(allowed_dir, exist_ok=True)
+        manager = OneBotAttachmentManager(
+            os.path.join(self.tmp, "data2"), 1024, local_source_dirs=[allowed_dir]
+        )
+        outside = self._write("outside.txt")
+        self.assertEqual(manager._get_local_source({"path": outside}), "")
+
+    def test_inside_allowlist_is_accepted(self):
+        allowed_dir = os.path.join(self.tmp, "allowed")
+        os.makedirs(allowed_dir, exist_ok=True)
+        inside = os.path.join(allowed_dir, "ok.txt")
+        with open(inside, "wb") as handle:
+            handle.write(b"x")
+        manager = OneBotAttachmentManager(
+            os.path.join(self.tmp, "data3"), 1024, local_source_dirs=[allowed_dir]
+        )
+        self.assertEqual(manager._get_local_source({"path": inside}), os.path.normpath(inside))
+
+    def test_rejected_source_surfaces_as_error(self):
+        allowed_dir = os.path.join(self.tmp, "allowed")
+        os.makedirs(allowed_dir, exist_ok=True)
+        manager = OneBotAttachmentManager(
+            os.path.join(self.tmp, "data4"), 1024, local_source_dirs=[allowed_dir]
+        )
+        outside = self._write("secret.txt")
+        attachments, errors = asyncio.run(
+            manager.download_attachments([{"type": "file", "data": {"path": outside}}])
+        )
+        self.assertEqual(attachments, [])
+        self.assertEqual(len(errors), 1)
+
+
+class UrlSchemeGuardTest(AttachmentManagerTestCase):
+    def test_non_http_scheme_is_refused(self):
+        dest = os.path.join(self.tmp, "out.bin")
+        self.assertEqual(self.manager._download_file_sync("file:///etc/passwd", dest), 0)
+        self.assertEqual(self.manager._download_file_sync("ftp://h/a", dest), 0)
+        self.assertFalse(os.path.exists(dest))
+
+
+class Base64SizeGuardTest(AttachmentManagerTestCase):
+    def test_oversize_payload_rejected_without_decoding(self):
+        # 编码长度就已超限时直接拒绝，避免把巨大 payload 解进内存
+        payload = "A" * (self.manager.max_file_bytes * 4)
+        self.assertEqual(
+            self.manager._save_base64_sync(payload, os.path.join(self.tmp, "x.bin")), 0
+        )
+
+
+class PruneTest(AttachmentManagerTestCase):
+    def _seed(self, kind, name, age_seconds):
+        path = os.path.join(self.manager.data_dirs[kind], name)
+        with open(path, "wb") as handle:
+            handle.write(b"x")
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_disabled_when_ttl_not_positive(self):
+        old = self._seed("image", "old.jpg", 10_000)
+        self.assertEqual(self.manager.prune(0), 0)
+        self.assertEqual(self.manager.prune(-5), 0)
+        self.assertTrue(os.path.exists(old))
+
+    def test_only_expired_files_removed(self):
+        old = self._seed("image", "old.jpg", 10_000)
+        fresh = self._seed("image", "fresh.jpg", 10)
+        self.assertEqual(self.manager.prune(3600), 1)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(fresh))
+
+    def test_all_kinds_are_swept(self):
+        self._seed("image", "a.jpg", 10_000)
+        self._seed("record", "b.amr", 10_000)
+        self._seed("file", "c.bin", 10_000)
+        self.assertEqual(self.manager.prune(3600), 3)
+
+    def test_missing_directory_is_tolerated(self):
+        shutil.rmtree(self.manager.data_dirs["image"], ignore_errors=True)
+        self.assertEqual(self.manager.prune(3600), 0)
 
 
 class CleanupAttachmentsTest(AttachmentManagerTestCase):
