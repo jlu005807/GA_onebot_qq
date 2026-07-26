@@ -6,6 +6,7 @@ import json
 import sys
 import uuid
 from typing import Any, Deque, Dict, List, Optional, Set
+from urllib.parse import quote, quote_plus
 
 from onebot_paths import setup_sys_path
 
@@ -224,10 +225,14 @@ class OneBotApp(AgentChatMixin):
         )
 
     def _redact(self, message: str) -> str:
-        # 第三方库抛出的异常常把整个连接 URL 带上，令牌不能就这样落进日志
-        token = (self.config.access_token or "").strip()
-        if token and token in message:
-            return message.replace(token, "***")
+        # 第三方库抛出的异常常把整个连接 URL 带上，令牌不能就这样落进日志。
+        # URL 里的令牌是转义过的，所以原文和两种转义形式都要替换。
+        token = (getattr(self.config, "access_token", "") or "").strip()
+        if not token:
+            return message
+        for variant in (token, quote(token, safe=""), quote_plus(token)):
+            if variant and variant in message:
+                message = message.replace(variant, "***")
         return message
 
     def _emit_log(self, message: str) -> None:
@@ -433,13 +438,20 @@ class OneBotApp(AgentChatMixin):
             item.chat_id, prompt, msg_id=item.message_id, is_group=item.is_group
         )
 
-    def _release_drain(self, user_id: str, task: Any) -> None:
-        """交还队列所有权。调用点必须与队列判空处于同一个无 await 区段。"""
+    def _release_drain(self, user_id: str, task: Any) -> bool:
+        """队列已空时交还所有权，返回是否真的交还了。
+
+        判空与注销必须原子完成，所以两件事都放在这里、且全程没有 await：
+        队列非空却注销掉 drain，积压的消息就没人消费了。
+        """
+        queue = self.state.user_queues.get(user_id)
+        if queue is not None and not queue.empty():
+            return False
         if self.state.user_drains.get(user_id) is task:
             self.state.user_drains.pop(user_id, None)
-        queue = self.state.user_queues.get(user_id)
-        if queue is not None and queue.empty():
+        if queue is not None:
             self.state.user_queues.pop(user_id, None)
+        return True
 
     async def _process_user_queue(self, user_id: str) -> None:
         queue = self.state.user_queues.get(user_id)
@@ -452,9 +464,8 @@ class OneBotApp(AgentChatMixin):
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=QUEUE_IDLE_SECONDS)
                 except asyncio.TimeoutError:
-                    # 无 await 区段：判空与注销一次做完，生产者不可能插进来
-                    if queue.empty():
-                        self._release_drain(user_id, current)
+                    # 无 await 区段：生产者不可能插进来
+                    if self._release_drain(user_id, current):
                         return
                     continue
 

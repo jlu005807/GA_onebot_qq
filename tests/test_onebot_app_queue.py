@@ -135,6 +135,37 @@ class UserQueueOwnershipTest(unittest.TestCase):
         asyncio.run(scenario())
         self.assertEqual([i.content for i in self.handled], ["a", "b", "c"])
 
+    def test_release_drain_refuses_while_queue_is_not_empty(self):
+        """不变式：队列非空时绝不交还所有权。"""
+
+        async def scenario():
+            queue = self.app._get_or_create_queue("10001")
+            queue.put_nowait(_make_item("stuck"))
+            sentinel = object()
+            self.state.user_drains["10001"] = sentinel
+
+            self.assertFalse(self.app._release_drain("10001", sentinel))
+            self.assertIs(self.state.user_drains["10001"], sentinel)
+            self.assertIn("10001", self.state.user_queues)
+
+            queue.get_nowait()
+            self.assertTrue(self.app._release_drain("10001", sentinel))
+            self.assertNotIn("10001", self.state.user_drains)
+            self.assertNotIn("10001", self.state.user_queues)
+
+        asyncio.run(scenario())
+
+    def test_release_drain_keeps_another_tasks_registration(self):
+        async def scenario():
+            self.app._get_or_create_queue("10001")
+            owner, other = object(), object()
+            self.state.user_drains["10001"] = owner
+            # 非持有者调用时不能把持有者的登记抹掉
+            self.assertTrue(self.app._release_drain("10001", other))
+            self.assertIs(self.state.user_drains["10001"], owner)
+
+        asyncio.run(scenario())
+
     def test_separate_users_get_separate_drains(self):
         async def scenario():
             self._enqueue("10001", _make_item("a", "10001"))
@@ -214,6 +245,22 @@ class BackgroundTaskTrackingTest(unittest.TestCase):
 
         asyncio.run(scenario())
         self.assertTrue(any("kaboom" in line for line in logs), logs)
+
+    def test_token_is_redacted_from_logs(self):
+        self.app.config.access_token = "s3cr3t/tok en"
+        logs = []
+        self.app._emit_log = lambda line: logs.append(self.app._redact(line))
+
+        self.app._emit_log("connect failed for ws://h/p?access_token=s3cr3t/tok en")
+        self.app._emit_log("url encoded: s3cr3t%2Ftok%20en")
+        self.app._emit_log("form encoded: s3cr3t%2Ftok+en")
+
+        for line in logs:
+            self.assertNotIn("s3cr3t", line, line)
+
+    def test_redact_is_a_noop_without_token(self):
+        self.app.config.access_token = ""
+        self.assertEqual(self.app._redact("plain message"), "plain message")
 
     def test_aclose_cancels_outstanding_tasks(self):
         async def scenario():
