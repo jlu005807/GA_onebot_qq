@@ -126,9 +126,41 @@ class ReadDotenvTest(unittest.TestCase):
         self.assertEqual(data["A"], "a # b")
 
     def test_hash_without_leading_space_is_kept(self):
-        # 令牌等值里可能本身带 #，只有空格后的 # 才当注释
+        # 令牌等值里可能本身带 #，只有空白后的 # 才当注释
         data = _read_dotenv(self._write("A=abc#def\n"))
         self.assertEqual(data["A"], "abc#def")
+
+    def test_value_starting_with_hash_is_kept_literally(self):
+        # 回归：曾经把整个值清空，而清空的白名单会退化成「放行全部」
+        data = _read_dotenv(self._write("A=#tag\nB=#123,#456\n"))
+        self.assertEqual(data["A"], "#tag")
+        self.assertEqual(data["B"], "#123,#456")
+
+    def test_space_before_hash_is_a_comment_even_with_empty_value(self):
+        data = _read_dotenv(self._write("A= # 整个值被注释掉了\n"))
+        self.assertEqual(data["A"], "")
+
+    def test_tab_before_hash_is_a_comment(self):
+        data = _read_dotenv(self._write("A=1\t# note\n"))
+        self.assertEqual(data["A"], "1")
+
+    def test_quoting_protects_prose_containing_hash(self):
+        # 含 '#' 的自然语言值必须加引号，否则会被行尾注释规则截断
+        data = _read_dotenv(self._write('A="请用纯文本回复 #不要markdown"\n'))
+        self.assertEqual(data["A"], "请用纯文本回复 #不要markdown")
+
+    def test_unquoted_prose_is_cut_at_the_comment_marker(self):
+        # 记录既有约定（与 python-dotenv 一致），文档里已说明需要加引号
+        data = _read_dotenv(self._write("A=请用纯文本回复 #不要markdown\n"))
+        self.assertEqual(data["A"], "请用纯文本回复")
+
+    def test_single_quote_character_is_not_treated_as_quoting(self):
+        data = _read_dotenv(self._write("A='\n"))
+        self.assertEqual(data["A"], "'")
+
+    def test_internal_spaces_are_preserved(self):
+        data = _read_dotenv(self._write("A=a b c\n"))
+        self.assertEqual(data["A"], "a b c")
 
     def test_line_without_equals_skipped(self):
         self.assertEqual(_read_dotenv(self._write("garbage\nA=1\n")), {"A": "1"})

@@ -84,7 +84,32 @@ class BuildFilenameTest(AttachmentManagerTestCase):
 
     def test_absurdly_long_name_is_capped(self):
         name = self.manager._build_filename("a" * 500 + "." + "b" * 100, "", ".bin")
-        self.assertLess(len(name), 130)
+        self.assertLessEqual(len(name.encode("utf-8")), 255)
+
+    def test_length_cap_is_bytes_not_characters(self):
+        # Linux NAME_MAX 是 255 字节；星文平面字符一个占 4 字节，按字符截断会超限
+        astral = "\U00020000" * 200
+        name = self.manager._build_filename(astral + ".txt", "", ".bin")
+        self.assertLessEqual(len(name.encode("utf-8")), 255)
+        self.assertTrue(name.endswith(".txt"))
+
+    def test_cjk_name_length_capped_in_bytes(self):
+        name = self.manager._build_filename("报" * 300 + ".pdf", "", ".bin")
+        self.assertLessEqual(len(name.encode("utf-8")), 255)
+
+    def test_default_extension_fallback_is_sanitized(self):
+        # 本地来源那条路径上 default_ext 由上报的文件路径推导，同样不可信
+        name = self.manager._build_filename("a.<>", "", ".<>")
+        for bad in "<>/\\:*?\"|":
+            self.assertNotIn(bad, name)
+
+    def test_unsanitizable_default_extension_falls_back_to_bin(self):
+        self.assertTrue(self.manager._build_filename("x", "", "...").endswith(".bin"))
+
+    def test_overlong_default_extension_is_capped(self):
+        name = self.manager._build_filename("x", "", "." + "z" * 300)
+        ext = os.path.splitext(name)[1]
+        self.assertLessEqual(len(ext), 17)
 
 
 class NormalizeLocalPathTest(AttachmentManagerTestCase):
@@ -268,6 +293,16 @@ class LocalSourceAllowlistTest(AttachmentManagerTestCase):
         )
         self.assertEqual(attachments, [])
         self.assertEqual(len(errors), 1)
+        # 策略拦截必须能与「没有可用来源」区分开，否则白名单根本没法排查
+        self.assertIn("ONEBOT_LOCAL_SOURCE_DIRS", errors[0])
+
+    def test_missing_source_error_does_not_blame_the_allowlist(self):
+        attachments, errors = asyncio.run(
+            self.manager.download_attachments([{"type": "image", "data": {"file": "abc.jpg"}}])
+        )
+        self.assertEqual(attachments, [])
+        self.assertIn("no usable source", errors[0])
+        self.assertNotIn("ONEBOT_LOCAL_SOURCE_DIRS", errors[0])
 
 
 class UrlSchemeGuardTest(AttachmentManagerTestCase):
@@ -284,6 +319,23 @@ class Base64SizeGuardTest(AttachmentManagerTestCase):
         payload = "A" * (self.manager.max_file_bytes * 4)
         self.assertEqual(
             self.manager._save_base64_sync(payload, os.path.join(self.tmp, "x.bin")), 0
+        )
+
+    def test_payload_of_exactly_max_size_is_accepted(self):
+        limit = self.manager.max_file_bytes
+        payload = base64.b64encode(b"x" * limit).decode()
+        self.assertEqual(
+            self.manager._save_base64_sync(payload, os.path.join(self.tmp, "exact.bin")), limit
+        )
+
+    def test_line_wrapped_payload_is_accepted(self):
+        # b64decode 会忽略空白，所以折行的 payload 不该因换行被误判超限
+        limit = self.manager.max_file_bytes
+        raw = base64.b64encode(b"y" * limit).decode()
+        wrapped = "\n".join(raw[i : i + 76] for i in range(0, len(raw), 76))
+        self.assertGreater(len(wrapped), len(raw))
+        self.assertEqual(
+            self.manager._save_base64_sync(wrapped, os.path.join(self.tmp, "wrapped.bin")), limit
         )
 
 
@@ -318,6 +370,24 @@ class PruneTest(AttachmentManagerTestCase):
     def test_missing_directory_is_tolerated(self):
         shutil.rmtree(self.manager.data_dirs["image"], ignore_errors=True)
         self.assertEqual(self.manager.prune(3600), 0)
+
+    def test_copied_attachment_is_not_born_expired(self):
+        """回归：shutil.copy2 会连源文件 mtime 一起复制，附件会一落盘就被判过期。"""
+        source = self._write("cached.jpg", b"x" * 16)
+        stale = time.time() - 10 * 86400
+        os.utime(source, (stale, stale))
+
+        attachments, errors = asyncio.run(
+            self.manager.download_attachments([{"type": "image", "data": {"path": source}}])
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(attachments), 1)
+        saved = attachments[0]["path"]
+
+        age = time.time() - os.stat(saved).st_mtime
+        self.assertLess(age, 60, "落盘附件的 mtime 应该是当前时间，不是源文件的")
+        self.assertEqual(self.manager.prune(86400), 0)
+        self.assertTrue(os.path.isfile(saved))
 
 
 class CleanupAttachmentsTest(AttachmentManagerTestCase):

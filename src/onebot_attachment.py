@@ -18,7 +18,8 @@ DEFAULT_EXTENSIONS = {
 }
 # 只保留文件名里安全的字符：允许中日韩等 Unicode 文字，剔除路径分隔符与控制字符
 UNSAFE_NAME_RE = re.compile(r"[^\w.\-]+", re.UNICODE)
-MAX_NAME_BASE_LEN = 64
+# 以字节计（Linux NAME_MAX = 255 字节），留足 "_" + 8 位 uuid + 扩展名的余量
+MAX_NAME_BASE_LEN = 180
 MAX_NAME_EXT_LEN = 16
 ALLOWED_URL_SCHEMES = {"http", "https"}
 
@@ -60,11 +61,23 @@ class OneBotAttachmentManager:
             os.makedirs(path, exist_ok=True)
 
     @staticmethod
-    def _sanitize_component(value: str, max_len: int) -> str:
+    def _truncate_utf8(value: str, max_bytes: int) -> str:
+        """按 UTF-8 字节数截断。
+
+        Linux 的 NAME_MAX 是 255 **字节**，而中日韩/星文平面字符一个占 3~4 字节，
+        按字符数截断会造出无法创建的文件名。
+        """
+        encoded = value.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return value
+        return encoded[:max_bytes].decode("utf-8", "ignore")
+
+    @classmethod
+    def _sanitize_component(cls, value: str, max_bytes: int) -> str:
         # 先取 basename 并把两种分隔符都切掉：Linux 上 os.path.basename 不认 "\"
         cleaned = str(value or "").replace("\\", "/").rsplit("/", 1)[-1]
         cleaned = UNSAFE_NAME_RE.sub("_", cleaned).strip("._ ")
-        return cleaned[:max_len]
+        return cls._truncate_utf8(cleaned, max_bytes).strip("._ ")
 
     def _build_filename(self, name_hint: str, source: str, default_ext: str) -> str:
         base = ""
@@ -77,9 +90,13 @@ class OneBotAttachmentManager:
             ext = default_ext
 
         base = self._sanitize_component(base, MAX_NAME_BASE_LEN) or "file"
-        # 扩展名同样必须清洗：它此前直接来自消息字段，从未被过滤
-        ext_body = self._sanitize_component(ext, MAX_NAME_EXT_LEN)
-        ext = f".{ext_body}" if ext_body else (default_ext or ".bin")
+        # 扩展名同样必须清洗：它此前直接来自消息字段，从未被过滤。
+        # 兜底的 default_ext 也要清洗——本地来源那条路径上它是由上报的
+        # 文件路径推导出来的，同样不可信。
+        ext_body = self._sanitize_component(ext, MAX_NAME_EXT_LEN) or self._sanitize_component(
+            default_ext, MAX_NAME_EXT_LEN
+        )
+        ext = f".{ext_body}" if ext_body else ".bin"
 
         suffix = uuid.uuid4().hex[:8]
         return f"{base}_{suffix}{ext}"
@@ -112,15 +129,25 @@ class OneBotAttachmentManager:
                 continue
         return False
 
-    def _get_local_source(self, data: Dict[str, Any]) -> str:
+    def _resolve_local_source(self, data: Dict[str, Any]) -> Tuple[str, str]:
+        """返回 (可用的本地路径, 被拒原因)。
+
+        区分「没有本地来源」和「有来源但被白名单挡掉」——两者以前都报
+        「no usable source」，让 ONEBOT_LOCAL_SOURCE_DIRS 极难排查。
+        """
+        blocked = ""
         for key in ("path", "file"):
             candidate = self._normalize_local_path(str(data.get(key, "")).strip())
             if not candidate or not os.path.isfile(candidate):
                 continue
             if not self._is_allowed_local_source(candidate):
+                blocked = candidate
                 continue
-            return candidate
-        return ""
+            return candidate, ""
+        return "", blocked
+
+    def _get_local_source(self, data: Dict[str, Any]) -> str:
+        return self._resolve_local_source(data)[0]
 
     def _normalize_local_path(self, value: str) -> str:
         raw = (value or "").strip().strip('"').strip("'")
@@ -191,11 +218,17 @@ class OneBotAttachmentManager:
             if size > self.max_file_bytes:
                 return 0
             shutil.copy2(source_path, dest_path)
+            # copy2 会把源文件的 mtime 一起复制过来，落盘的附件于是「一出生就过期」，
+            # 下一轮 prune() 立刻把它删掉。必须重置为当前时间。
+            os.utime(dest_path, None)
             return size
         except OSError:
             return 0
 
     def _save_base64_sync(self, payload: str, dest_path: str) -> int:
+        # b64decode(validate=False) 会忽略空白字符，所以必须先去掉空白，
+        # 否则按 76 列折行的 payload 会因为换行被误判超限。
+        payload = "".join(payload.split())
         # 先按编码长度粗筛，避免为了判大小把一个超大 payload 整块解码进内存
         if len(payload) > (self.max_file_bytes // 3 + 1) * 4 + 16:
             return 0
@@ -272,7 +305,7 @@ class OneBotAttachmentManager:
                     attachments.append(saved)
                     continue
 
-            local_source = self._get_local_source(data)
+            local_source, blocked = self._resolve_local_source(data)
             if local_source:
                 saved = await self._save_from_local_path(seg_type, local_source, name_hint)
                 if saved:
@@ -286,7 +319,12 @@ class OneBotAttachmentManager:
                     attachments.append(saved)
                     continue
 
-            errors.append(f"{seg_type} has no usable source (url/path/base64)")
+            if blocked:
+                errors.append(
+                    f"{seg_type} local source blocked by ONEBOT_LOCAL_SOURCE_DIRS: {blocked}"
+                )
+            else:
+                errors.append(f"{seg_type} has no usable source (url/path/base64)")
         return attachments, errors
 
     def prune(self, ttl_seconds: int) -> int:

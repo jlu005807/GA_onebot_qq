@@ -153,6 +153,16 @@ python3 src/main.py
 
 ## 6. .env 配置详解
 
+取值规则（与 `python-dotenv` 一致）：
+
+- 环境变量优先于 `.env` 文件。
+- 未加引号的值会被**行尾注释**截断，`#` 前必须有空格或制表符：
+  - `ONEBOT_MAX_MSG_LENGTH=500   # 注释` → `500`
+  - `ONEBOT_ACCESS_TOKEN=abc#def` → `abc#def`（紧贴的 `#` 属于值本身）
+- 值里含 `#`、或需要保留首尾空格时**必须加引号**，否则会被截断且没有任何提示：
+  - `ONEBOT_PLAIN_TEXT_HINT="请用纯文本回复 #不要用markdown"`
+- 支持 `export KEY=value` 写法；文件可带 BOM。
+
 | 键 | 默认值 | 必填 | 说明 |
 |---|---|---|---|
 | `ONEBOT_WS_URL` | `ws://127.0.0.1:8080/onebot/v11/ws` | 是 | NapCat OneBot WS 地址。若只填到端口，程序会自动补 `/onebot/v11/ws`。 |
@@ -305,6 +315,8 @@ attachment1: type=image path=D:\...\data\image\xxx.jpg size=123KB
 ### Q12: 附件下载总是失败？
 - 只允许 `http(s)` 直链，且不跟随跨协议重定向。
 - 若配了 `ONEBOT_LOCAL_SOURCE_DIRS`，本地来源必须落在白名单目录内。
+  被白名单挡掉时回复里会明确写 `local source blocked by ONEBOT_LOCAL_SOURCE_DIRS: <路径>`，
+  与「确实没有可用来源」区分开。
 - 也检查 `ONEBOT_MAX_FILE_BYTES` 是否小于实际文件。
 
 ## 11. 备注

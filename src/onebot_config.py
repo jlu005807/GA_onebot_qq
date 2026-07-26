@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 from typing import Dict, Optional, Set, Tuple
 
@@ -17,6 +18,9 @@ DEFAULT_SPLIT_LIMIT = 1500
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# 行尾注释：'#' 前必须有空白，否则算值的一部分（与 python-dotenv 行为一致）
+INLINE_COMMENT_RE = re.compile(r"[ \t]#")
+
 
 def _read_dotenv(path: str) -> Dict[str, str]:
     # 仅解析本地 .env，不写入环境变量
@@ -33,20 +37,23 @@ def _read_dotenv(path: str) -> Dict[str, str]:
                 line = line[len("export ") :].strip()
             if "=" not in line:
                 continue
-            key, value = line.split("=", 1)
+            key, raw_value = line.split("=", 1)
             key = key.strip()
-            value = value.strip()
             if not key:
                 continue
-            if value and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = raw_value.strip()
+            if len(value) > 1 and value[0] == value[-1] and value[0] in ("'", '"'):
+                # 带引号时原样保留，是值里含 '#' 或首尾空格时的唯一写法
                 value = value[1:-1]
             else:
-                # 未加引号时支持行尾注释：ONEBOT_X=1  # 说明
-                hash_pos = value.find("#")
-                if hash_pos > 0 and value[hash_pos - 1] in (" ", "\t"):
-                    value = value[:hash_pos].strip()
-                elif hash_pos == 0:
-                    value = ""
+                # 未加引号时支持行尾注释，且 '#' 必须与值之间有空白：
+                #   A=1  # 说明  -> "1"
+                #   A=abc#def   -> "abc#def"（紧贴，属于值本身）
+                # 判定必须在未 strip 的原始右值上做，否则 "A= #x"（注释）
+                # 和 "A=#x"（值以 # 开头）无法区分。
+                match = INLINE_COMMENT_RE.search(raw_value)
+                if match:
+                    value = raw_value[: match.start()].strip()
             data[key] = value
     return data
 
