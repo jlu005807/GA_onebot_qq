@@ -1,10 +1,11 @@
 import asyncio
-from collections import deque
+from collections import OrderedDict, deque
+import contextlib
 import inspect
 import json
 import sys
 import uuid
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Set
 
 from onebot_paths import setup_sys_path
 
@@ -24,7 +25,7 @@ from onebot_message import (
     normalize_outgoing_content,
     parse_send_content,
 )
-from onebot_state import OneBotState
+from onebot_state import OneBotState, QueuedMessage
 from onebot_ws import build_ws_connect_url, mask_ws_url
 
 try:
@@ -35,11 +36,17 @@ except ImportError:
 
 
 QUEUE_IDLE_SECONDS = 5
+# 同一用户连续两条消息之间的最小间隔，避免触发 QQ 侧发送频率限制
+QUEUE_ITEM_INTERVAL_SECONDS = 1
 HISTORY_MAXLEN = 40
 HISTORY_TEXT_MAXLEN = 300
+# 最多为多少个会话保留上下文历史，防止长期运行时无界增长
+HISTORY_MAX_CHATS = 500
 ADMIN_COMMANDS = {"/stop", "/new", "/restore", "/continue"}
 SEND_GROUP_ACTION = "send_group_msg"
 SEND_PRIVATE_ACTION = "send_private_msg"
+RECONNECT_MIN_SECONDS = 5
+RECONNECT_MAX_SECONDS = 60
 
 
 class OneBotApp(AgentChatMixin):
@@ -56,7 +63,26 @@ class OneBotApp(AgentChatMixin):
             max_file_bytes=self.config.max_file_bytes,
         )
         self._pending_calls: Dict[str, asyncio.Future] = {}
-        self._chat_histories: Dict[str, Deque[str]] = {}
+        self._chat_histories: "OrderedDict[str, Deque[str]]" = OrderedDict()
+        # 持有后台任务的强引用：asyncio 只弱引用运行中的任务，丢引用会被 GC 中途回收
+        self._bg_tasks: Set["asyncio.Task[Any]"] = set()
+        self._closing = False
+
+    def _track(self, task: "asyncio.Task[Any]") -> "asyncio.Task[Any]":
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    def _on_task_done(self, task: "asyncio.Task[Any]") -> None:
+        self._bg_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._emit_log(f"[OneBot] background task failed: {exc!r}")
+
+    def _spawn(self, coro, *, name: Optional[str] = None) -> "asyncio.Task[Any]":
+        return self._track(asyncio.ensure_future(coro))
 
     def _is_admin_user(self, user_id: str) -> bool:
         return user_id in self.config.admin_set
@@ -79,8 +105,16 @@ class OneBotApp(AgentChatMixin):
         return True
 
     async def send_text(self, chat_id, content, *, msg_id=None, is_group=False, **ctx):
-        if not self.ws:
+        # 整条消息固定使用同一个连接对象：重连发生时应整体失败，而不是发出半截消息
+        ws = self.ws
+        if not ws:
             self._emit_log("[OneBot] ws not connected, cannot send")
+            return
+
+        try:
+            target = int(str(chat_id).strip())
+        except (TypeError, ValueError):
+            self._emit_log(f"[OneBot] invalid chat_id, cannot send: {chat_id!r}")
             return
 
         content = normalize_outgoing_content(content or "")
@@ -89,7 +123,7 @@ class OneBotApp(AgentChatMixin):
         action = SEND_GROUP_ACTION if is_group else SEND_PRIVATE_ACTION
 
         for part in split_text(content, self.split_limit):
-            params = {"group_id": int(chat_id)} if is_group else {"user_id": int(chat_id)}
+            params = {"group_id": target} if is_group else {"user_id": target}
             msg_segments = []
             if msg_id:
                 msg_segments.append({"type": "reply", "data": {"id": str(msg_id)}})
@@ -106,9 +140,10 @@ class OneBotApp(AgentChatMixin):
                 "echo": str(self.state.next_msg_id()),
             }
             try:
-                await self.ws.send(json.dumps(payload))
+                await ws.send(json.dumps(payload))
             except Exception as exc:
                 self._emit_log(f"[OneBot] send error: {exc}")
+                return
 
     def _get_or_create_queue(self, user_id: str) -> asyncio.Queue:
         if user_id not in self.state.user_queues:
@@ -132,6 +167,9 @@ class OneBotApp(AgentChatMixin):
         if history is None:
             history = deque(maxlen=HISTORY_MAXLEN)
             self._chat_histories[key] = history
+        self._chat_histories.move_to_end(key)
+        while len(self._chat_histories) > HISTORY_MAX_CHATS:
+            self._chat_histories.popitem(last=False)
         return history
 
     def _append_history_message(
@@ -143,6 +181,9 @@ class OneBotApp(AgentChatMixin):
         sender_nickname: str,
         content: str,
     ) -> None:
+        # 上下文功能关闭时不必攒历史，否则长期运行会为每个会话白白占用内存
+        if self.config.context_messages <= 0:
+            return
         text = (content or "").replace("\r", " ").replace("\n", " ").strip()
         if not text:
             return
@@ -340,76 +381,88 @@ class OneBotApp(AgentChatMixin):
             seg["data"] = updated
         return segments
 
-    async def _process_user_queue(self, user_id: str) -> None:
-        queue = self.state.user_queues.get(user_id)
-        if not queue:
+    def _ensure_drain_task(self, user_id: str) -> None:
+        """确保该用户有且只有一个 drain 任务。
+
+        任务在创建的同一步就登记到 state.user_drains（同步、无 await），
+        因此不会出现「两个 handler 都看到没人在跑、于是各建一个」的竞态。
+        """
+        task = self.state.user_drains.get(user_id)
+        if task is not None and not task.done():
+            return
+        self.state.user_drains[user_id] = self._spawn(self._process_user_queue(user_id))
+
+    async def _handle_queue_item(self, item: QueuedMessage) -> None:
+        if item.content and item.content.startswith("/"):
+            await self.handle_command(
+                item.chat_id, item.content, msg_id=item.message_id, is_group=item.is_group
+            )
             return
 
-        self.state.processing_users.add(user_id)
+        prompt = build_agent_prompt(
+            item.content,
+            item.attachments,
+            is_group=item.is_group,
+            is_admin=item.is_admin,
+            include_admin_policy=bool(self.config.admin_set),
+            sender_nickname=item.sender_nickname,
+            sender_qq=item.sender_qq,
+            at_mentions=item.at_mentions,
+            history_messages=item.history_messages,
+            plain_text_hint=self.config.plain_text_hint,
+        )
+        self._log_prompt_preview(
+            item.chat_id, prompt, is_group=item.is_group, sender_qq=item.sender_qq
+        )
+        await self.run_agent(
+            item.chat_id, prompt, msg_id=item.message_id, is_group=item.is_group
+        )
+
+    def _release_drain(self, user_id: str, task: Any) -> None:
+        """交还队列所有权。调用点必须与队列判空处于同一个无 await 区段。"""
+        if self.state.user_drains.get(user_id) is task:
+            self.state.user_drains.pop(user_id, None)
+        queue = self.state.user_queues.get(user_id)
+        if queue is not None and queue.empty():
+            self.state.user_queues.pop(user_id, None)
+
+    async def _process_user_queue(self, user_id: str) -> None:
+        queue = self.state.user_queues.get(user_id)
+        if queue is None:
+            return
+        current = asyncio.current_task()
+
         try:
             while True:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=QUEUE_IDLE_SECONDS)
                 except asyncio.TimeoutError:
-                    break
+                    # 无 await 区段：判空与注销一次做完，生产者不可能插进来
+                    if queue.empty():
+                        self._release_drain(user_id, current)
+                        return
+                    continue
 
                 try:
-                    (
-                        content,
-                        attachments,
-                        message_id,
-                        chat_id,
-                        is_group,
-                        is_admin,
-                        sender_qq,
-                        sender_nickname,
-                        at_mentions,
-                        history_messages,
-                    ) = item
-
-                    if content and content.startswith("/"):
-                        await self.handle_command(
-                            chat_id, content, msg_id=message_id, is_group=is_group
-                        )
-                    else:
-                        prompt = build_agent_prompt(
-                            content,
-                            attachments,
-                            is_group=is_group,
-                            is_admin=is_admin,
-                            include_admin_policy=bool(self.config.admin_set),
-                            sender_nickname=sender_nickname,
-                            sender_qq=sender_qq,
-                            at_mentions=at_mentions,
-                            history_messages=history_messages,
-                            plain_text_hint=self.config.plain_text_hint,
-                        )
-                        self._log_prompt_preview(
-                            chat_id,
-                            prompt,
-                            is_group=is_group,
-                            sender_qq=sender_qq,
-                        )
-                        await self.run_agent(
-                            chat_id, prompt, msg_id=message_id, is_group=is_group
-                        )
-                    await asyncio.sleep(1)
+                    await self._handle_queue_item(item)
                 except Exception as exc:
                     self._emit_log(f"[OneBot] queue item error: {exc}")
                 finally:
                     queue.task_done()
+                if self._closing:
+                    return
+                if QUEUE_ITEM_INTERVAL_SECONDS > 0:
+                    await asyncio.sleep(QUEUE_ITEM_INTERVAL_SECONDS)
         finally:
-            self.state.processing_users.discard(user_id)
-            if user_id in self.state.user_queues and self.state.user_queues[user_id].empty():
-                del self.state.user_queues[user_id]
+            # 取消/异常退出时兜底注销，避免把用户永久卡在「已有 drain」状态
+            if self.state.user_drains.get(user_id) is current:
+                self.state.user_drains.pop(user_id, None)
 
     async def _handle_message_event(self, event: dict) -> None:
         raw_msg = event.get("message", "")
         message_id = event.get("message_id")
-        if message_id is not None:
-            if message_id in self.state.processed_ids:
-                return
-            self.state.processed_ids.append(message_id)
+        if self.state.seen_message(message_id):
+            return
 
         msg_type = event.get("message_type")
         is_group = msg_type == "group"
@@ -497,8 +550,9 @@ class OneBotApp(AgentChatMixin):
             await self.handle_command(chat_id, content, msg_id=message_id, is_group=is_group)
             return
 
-        queue = self._get_or_create_queue(user_id)
-        if queue.full():
+        # 早退检查：附件下载前先看队列是否已满，避免白白下载后再丢弃
+        existing = self.state.user_queues.get(user_id)
+        if existing is not None and existing.full():
             await self._send_queue_full(chat_id, msg_id=message_id, is_group=is_group)
             return
 
@@ -516,32 +570,34 @@ class OneBotApp(AgentChatMixin):
             )
 
         if not content and not attachments:
+            cleanup_attachments(attachments)
             return
 
         at_mentions = extract_at_mentions(raw_msg, self.bot_qq)
+        item = QueuedMessage(
+            content=content,
+            attachments=attachments,
+            message_id=message_id,
+            chat_id=chat_id,
+            is_group=is_group,
+            is_admin=is_admin,
+            sender_qq=user_id,
+            sender_nickname=sender_nickname,
+            at_mentions=at_mentions,
+            history_messages=history_messages,
+        )
 
+        # 从这里到 _ensure_drain_task 之间不允许出现 await：
+        # 队列必须在所有耗时等待之后才获取，否则 drain 可能已把它从 dict 里删掉，
+        # 消息就会被投进一个没人消费的孤儿队列而永久丢失。
+        queue = self._get_or_create_queue(user_id)
         try:
-            queue.put_nowait(
-                (
-                    content,
-                    attachments,
-                    message_id,
-                    chat_id,
-                    is_group,
-                    is_admin,
-                    user_id,
-                    sender_nickname,
-                    at_mentions,
-                    history_messages,
-                )
-            )
+            queue.put_nowait(item)
         except asyncio.QueueFull:
             cleanup_attachments(attachments)
             await self._send_queue_full(chat_id, msg_id=message_id, is_group=is_group)
             return
-
-        if user_id not in self.state.processing_users:
-            asyncio.create_task(self._process_user_queue(user_id))
+        self._ensure_drain_task(user_id)
 
     async def handle_event(self, event: dict) -> None:
         post_type = event.get("post_type", "")
@@ -559,7 +615,8 @@ class OneBotApp(AgentChatMixin):
         connect_sig = inspect.signature(websockets.connect)
         header_arg = "additional_headers" if "additional_headers" in connect_sig.parameters else "extra_headers"
 
-        while True:
+        backoff = RECONNECT_MIN_SECONDS
+        while not self._closing:
             try:
                 self._emit_log(f"[OneBot] connecting to {display_url} ...")
                 connect_kwargs = {
@@ -572,8 +629,8 @@ class OneBotApp(AgentChatMixin):
                 async with websockets.connect(connect_url, **connect_kwargs) as ws:
                     self.ws = ws
                     self._emit_log("[OneBot] connected!")
+                    backoff = RECONNECT_MIN_SECONDS
 
-                    heartbeat_task = asyncio.create_task(self._heartbeat())
                     try:
                         async for raw_msg in ws:
                             try:
@@ -599,14 +656,16 @@ class OneBotApp(AgentChatMixin):
                                 await ws.close()
                                 break
 
-                            asyncio.create_task(self.handle_event(event))
+                            self._spawn(self.handle_event(event))
                     finally:
-                        heartbeat_task.cancel()
                         for fut in list(self._pending_calls.values()):
                             if fut and not fut.done():
                                 fut.set_exception(RuntimeError("websocket disconnected"))
                         self._pending_calls.clear()
                         self.ws = None
+            except asyncio.CancelledError:
+                self._closing = True
+                raise
             except websockets.exceptions.ConnectionClosed as exc:
                 self._emit_log(f"[OneBot] connection closed: {exc}")
             except ConnectionRefusedError:
@@ -614,12 +673,28 @@ class OneBotApp(AgentChatMixin):
             except Exception as exc:
                 self._emit_log(f"[OneBot] error: {exc}")
 
-            self._emit_log("[OneBot] reconnect in 5s...")
-            await asyncio.sleep(5)
-
-    async def _heartbeat(self):
-        while True:
-            try:
-                await asyncio.sleep(15)
-            except asyncio.CancelledError:
+            if self._closing:
                 break
+            # 指数退避：NapCat 长时间不可用时不再每 5 秒空转刷屏
+            self._emit_log(f"[OneBot] reconnect in {backoff}s...")
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                self._closing = True
+                raise
+            backoff = min(backoff * 2, RECONNECT_MAX_SECONDS)
+
+    async def aclose(self) -> None:
+        """停止接收新消息并等待在途后台任务收敛。"""
+        self._closing = True
+        ws = self.ws
+        if ws is not None:
+            with contextlib.suppress(Exception):
+                await ws.close()
+        pending = [task for task in list(self._bg_tasks) if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self.state.user_drains.clear()
+        self.state.user_queues.clear()

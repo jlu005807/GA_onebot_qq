@@ -25,6 +25,16 @@ def _build_timestamped_log_name(log_name: str) -> str:
     return f"{stem}_{ts}{ext}"
 
 
+async def _serve(app: OneBotApp) -> None:
+    # Ctrl+C 时先停止收新消息、等在途任务收敛，再退出，避免半途中断工具调用
+    try:
+        await app.connect_and_run()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await app.aclose()
+
+
 def run() -> None:
     # 入口：加载配置并启动 OneBot
     config = load_config()
@@ -44,7 +54,13 @@ def run() -> None:
 
     app = OneBotApp(state, config)
     # 启动 WebSocket 事件循环
-    asyncio.run(app.connect_and_run())
+    try:
+        asyncio.run(_serve(app))
+    except KeyboardInterrupt:
+        print("[OneBot] interrupted, shutting down...")
+    finally:
+        agent.abort()
+        _lock_sock.close()
 
 
 if __name__ == "__main__":
